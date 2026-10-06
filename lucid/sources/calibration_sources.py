@@ -8,7 +8,8 @@ import jax.numpy as jnp
 from jax import random
 from typing import NamedTuple
 from functools import partial
-from lucid.utils import normalize, generate_orthonormal_basis
+from lucid.utils import normalize, generate_orthonormal_basis, jax_rotate_vector
+from lucid.sources.load_HKLI_profile import build_profile_cdf, build_fit_cdf
 
 
 @partial(jax.jit, static_argnums=(2,))
@@ -349,5 +350,132 @@ def laser_source(position, intensity=1_000_000, direction=None, fiber_NA=0.22,
         intensity=jnp.asarray(float(intensity), dtype=jnp.float32),
         direction=jnp.asarray(direction, dtype=jnp.float32),
         fiber_NA=jnp.asarray(float(fiber_NA), dtype=jnp.float32),
+        wavelength=wl,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Measured-profile source, ported from HKUKLI/measured_profile_source_job.py.
+# ---------------------------------------------------------------------------
+
+def _axis_angle_from_x_axis(direction):
+    direction = normalize(direction)
+    u_ref = jnp.array([1.0, 0.0, 0.0])
+    angle = jnp.arccos(jnp.clip(jnp.dot(u_ref, direction), -1.0, 1.0))
+    axis = jnp.cross(u_ref, direction)
+    axis_norm = jnp.linalg.norm(axis)
+    axis = jnp.where(axis_norm > 1e-8, axis / jnp.where(axis_norm > 1e-8, axis_norm, 1.0),
+                      jnp.array([0.0, 1.0, 0.0]))
+    return axis, angle
+
+
+def _sample_u_phi(key, fine_u, marginal_cdf, fine_phi, cond, n_photons):
+    key_u, key_phi = random.split(key)
+    q1 = random.uniform(key_u, (n_photons,))
+    q2 = random.uniform(key_phi, (n_photons,))
+    u_s = jnp.interp(q1, marginal_cdf, fine_u)
+    row_idx = jnp.clip(jnp.searchsorted(fine_u, u_s), 0, fine_u.shape[0] - 1)
+    cond_rows = cond[row_idx]
+    phi_s = jax.vmap(lambda row, q: jnp.interp(q, row, fine_phi))(cond_rows, q2)
+    return u_s, phi_s
+
+
+@partial(jax.jit, static_argnums=(9,))
+def sample_measured_profile_rays(position, rotation_axis, rotation_angle,
+                                  fine_u, marginal_cdf, fine_phi, cond,
+                                  is_collimator, intensity, n_photons, key):
+    u_s, phi_s = _sample_u_phi(key, fine_u, marginal_cdf, fine_phi, cond, n_photons)
+    polar_s = jnp.arccos(jnp.clip(u_s, -1.0, 1.0))
+    phi_rad = jnp.radians(phi_s)
+
+    d_collimator = jnp.stack([
+        jnp.sin(polar_s) * jnp.cos(phi_rad),
+        jnp.sin(polar_s) * jnp.sin(phi_rad),
+        jnp.cos(polar_s),
+    ], axis=-1)
+    d_diffuser = jnp.stack([
+        jnp.cos(polar_s),
+        jnp.sin(polar_s) * jnp.cos(phi_rad),
+        jnp.sin(polar_s) * jnp.sin(phi_rad),
+    ], axis=-1)
+    d_native = jnp.where(is_collimator, d_collimator, d_diffuser)
+
+    ray_vectors = jax.vmap(lambda v: jax_rotate_vector(v, rotation_axis, rotation_angle))(d_native)
+    ray_origins = jnp.tile(position[None, :], (n_photons, 1))
+    photon_weights = jnp.full((n_photons,), intensity / n_photons)
+    return ray_vectors, ray_origins, photon_weights
+
+
+class MeasuredProfileSource(NamedTuple):
+    """Calibration source drawn from a real goniometer profile scan -- callable JAX pytree.
+
+    Usage: ``source(n_photons, key)`` or ``source(n_photons, key, n_water)``.
+    Built via `measured_profile_source`; see HKUKLI/injector_profile_comparison.ipynb
+    and HKUKLI/measured_profile_source_job.py for derivation/validation.
+    """
+    position: jnp.ndarray
+    rotation_axis: jnp.ndarray
+    rotation_angle: jnp.ndarray
+    fine_u: jnp.ndarray
+    marginal_cdf: jnp.ndarray
+    fine_phi: jnp.ndarray
+    cond: jnp.ndarray
+    is_collimator: jnp.ndarray
+    intensity: jnp.ndarray = jnp.float32(1.0)
+    wavelength: object = None
+
+    def __call__(self, n_photons, key, n_water=1.33):
+        return sample_measured_profile_rays(
+            self.position, self.rotation_axis, self.rotation_angle,
+            self.fine_u, self.marginal_cdf, self.fine_phi, self.cond,
+            self.is_collimator, self.intensity, n_photons, key,
+        )
+
+
+def measured_profile_source(position, direction, sample_id, common_profiles_dir,
+                             intensity=1_000_000, wavelength=None):
+    """Build a MeasuredProfileSource from a common_profiles/<sample_id>.npz scan."""
+    fine_u, marginal_cdf, fine_phi, cond, device_type = build_profile_cdf(common_profiles_dir, sample_id)
+
+    rotation_axis, rotation_angle = _axis_angle_from_x_axis(jnp.asarray(direction, dtype=jnp.float32))
+    wl = jnp.asarray(float(wavelength), dtype=jnp.float32) if wavelength is not None else None
+
+    return MeasuredProfileSource(
+        position=jnp.asarray(position, dtype=jnp.float32),
+        rotation_axis=rotation_axis,
+        rotation_angle=rotation_angle,
+        fine_u=jnp.asarray(fine_u, dtype=jnp.float32),
+        marginal_cdf=jnp.asarray(marginal_cdf, dtype=jnp.float32),
+        fine_phi=jnp.asarray(fine_phi, dtype=jnp.float32),
+        cond=jnp.asarray(cond, dtype=jnp.float32),
+        is_collimator=jnp.asarray(device_type != 'diffuser'),
+        intensity=jnp.asarray(float(intensity), dtype=jnp.float32),
+        wavelength=wl,
+    )
+
+
+def fitted_profile_source(position, direction, params, alpha_max,
+                           intensity=1_000_000, wavelength=None):
+    """Build a MeasuredProfileSource from an already-fitted composite(w,p,a0,s) model
+    instead of a measured grid -- phi-uniform, so is_collimator=False (the pole-embedding
+    convention alpha already assumes). params/alpha_max come from
+    HKUKLI/injector_profile_comparison.ipynb's `fit_common_profile` (PyROOT/Minuit2 --
+    run offline, not here).
+    """
+    fine_u, marginal_cdf, fine_phi, cond = build_fit_cdf(params, alpha_max)
+
+    rotation_axis, rotation_angle = _axis_angle_from_x_axis(jnp.asarray(direction, dtype=jnp.float32))
+    wl = jnp.asarray(float(wavelength), dtype=jnp.float32) if wavelength is not None else None
+
+    return MeasuredProfileSource(
+        position=jnp.asarray(position, dtype=jnp.float32),
+        rotation_axis=rotation_axis,
+        rotation_angle=rotation_angle,
+        fine_u=jnp.asarray(fine_u, dtype=jnp.float32),
+        marginal_cdf=jnp.asarray(marginal_cdf, dtype=jnp.float32),
+        fine_phi=jnp.asarray(fine_phi, dtype=jnp.float32),
+        cond=jnp.asarray(cond, dtype=jnp.float32),
+        is_collimator=jnp.asarray(False),
+        intensity=jnp.asarray(float(intensity), dtype=jnp.float32),
         wavelength=wl,
     )
