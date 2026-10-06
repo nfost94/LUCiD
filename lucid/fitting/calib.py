@@ -389,15 +389,29 @@ def profile_gains(model_charge, observed_sum, gauge='log', clip_min=1e-6):
     raise ValueError(f"gauge must be 'log' or 'linear', got {gauge!r}")
 
 
-def neyman_residual(model_charge, data, q_floor):
-    """``r = (k·M − Q) / √clip(Q, floor)``.
+def neyman_variance(data, q_floor, frac=0.0):
+    """The per-sensor variance in the Neyman weight: ``clip(Q, floor) + (frac·Q)²``.
+
+    ``frac`` is a fractional (model/systematic) uncertainty. It leaves dim sensors at their
+    Poisson weight and caps a bright sensor's pull at about ``1/frac²`` Poisson-equivalent counts,
+    so a few hundred narrow-beam spot PMTs cannot dominate the fit. Still data-only. ``frac=0``
+    returns ``clip(Q, floor)`` itself, so the published estimator is unchanged bit for bit.
+    """
+    var = jnp.clip(data, q_floor, None)
+    if frac:
+        var = var + (frac * data) ** 2
+    return var
+
+
+def neyman_residual(model_charge, data, q_floor, frac=0.0):
+    """``r = (k·M − Q) / √(clip(Q, floor) + (frac·Q)²)`` — see :func:`neyman_variance`.
 
     The weight depends on the DATA only. That is the whole point: the forward model is a
     Monte-Carlo estimate redrawn every step, so a weight involving ``M`` would make the residual
     nonlinear in it and bias the gradient — permanently displacing the fixed point rather than
     merely adding noise. Neyman is the member of the χ² family whose weight is data-only.
     """
-    return (model_charge - data) / jnp.sqrt(jnp.clip(data, q_floor, None))
+    return (model_charge - data) / jnp.sqrt(neyman_variance(data, q_floor, frac))
 
 
 class CalibrationProblem:
@@ -422,13 +436,17 @@ class CalibrationProblem:
 
     def __init__(self, forward, jacobian, params, data, q_floor, *,
                  gauge='log', n_forward_draws=1, jacobian_draws=2,
-                 forward_key0=1000, forward_key_stride=13):
+                 forward_key0=1000, forward_key_stride=13, frac=0.0):
         self.forward = forward
         self.jacobian = jacobian
         self.params = params
         self.data = data                                   # (S, NS) observed charge
         self.data_sum = data.sum(0)
         self.q_floor = float(q_floor)
+        self.frac = float(frac)
+        # The Jacobian uses its data argument only as the weight's variance, √clip(·, floor). Handing
+        # it the full Neyman variance (which is already >= floor) makes J weight exactly as r does.
+        self._q_jac = data if not self.frac else neyman_variance(data, self.q_floor, self.frac)
         self.gauge = gauge
         self.n_forward_draws = int(n_forward_draws)
         self.jacobian_draws = int(jacobian_draws)
@@ -448,10 +466,10 @@ class CalibrationProblem:
         ones = jnp.ones(self.data.shape[1])
         mu = self.forward.average(theta, self.forward_key(step), ones, self.n_forward_draws)
         k = profile_gains(mu.sum(0) + 1e-12, self.data_sum, gauge=self.gauge)
-        r = neyman_residual(k[None, :] * mu, self.data, self.q_floor)
+        r = neyman_residual(k[None, :] * mu, self.data, self.q_floor, self.frac)
 
         if refresh or self._J is None:
-            self._J = self.jacobian(theta, jnp.log(k), step, self.data, self.q_floor,
+            self._J = self.jacobian(theta, jnp.log(k), step, self._q_jac, self.q_floor,
                                     draws=range(self.jacobian_draws))
         J = self._J
         n = self.n_configs
