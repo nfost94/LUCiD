@@ -83,3 +83,7 @@ core.[0-9]*
 HKUKLI/*.npz
 HKUKLI/common_profiles/
 HKUKLI/UKLIinfo/
+
+# ROOT interpreter history and local build artifacts
+.root_hist
+*.o

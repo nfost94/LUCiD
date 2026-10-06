@@ -72,15 +72,56 @@ def test_multi_hit_and_deadtime_veto():
     assert r2.photon_digit_idx[2] == -1
 
 
-def test_threshold_drops_subthreshold_digit():
+def test_windowing_does_not_apply_the_discriminator():
+    """digitize_event windows; the discriminator is a readout stage.
+
+    A discriminator fires on the analogue pulse, so it has to run after the SPE
+    spectrum is sampled. Cutting here instead would act on the integrated
+    photoelectron count, where it is inert -- every hit sensor has at least one
+    photoelectron.
+    """
     model = resolve_model_config("ski")  # threshold 0.25 pe
     sensor = np.array([3, 3])
     times = np.array([500.0, 2000.0])
-    charges = np.array([0.1, 1.0])   # first digit below threshold, second above
+    charges = np.array([0.1, 1.0])
     r = digitize_event(sensor, times, charges, n_sensors=4, model=model)
-    assert r.n_digits == 1
-    np.testing.assert_allclose(r.digit_pe_true, [1.0])
-    assert r.photon_digit_idx[0] == -1 and r.photon_digit_idx[1] == 0
+    assert r.n_digits == 2
+    np.testing.assert_allclose(sorted(r.digit_pe_true), [0.1, 1.0])
+
+    # The cut lives here instead, on the digitised charge.
+    from lucid.simulation.digitizer import apply_discriminator
+    keep = apply_discriminator(np.array([0.1, 1.0]), model)
+    np.testing.assert_array_equal(keep, [False, True])
+    # basic has no discriminator, so nothing is ever dropped.
+    np.testing.assert_array_equal(
+        apply_discriminator(np.array([0.0, 0.1]), resolve_model_config("basic")),
+        [True, True])
+
+
+def test_discriminator_drops_digits_and_remaps_digit_idx():
+    """Surviving digits are renumbered and every deposit's digit_idx follows.
+
+    hits.h5 / step's digit_idx is a foreign key into sensor.h5; a stale index
+    after the cut would silently point at the wrong digit.
+    """
+    rng = _rng()
+    n = 400
+    sd, hits, seg = digitize_and_decompose(
+        sensor_idx=rng.integers(0, 30, size=n),
+        charge=np.ones(n), t_true=rng.uniform(0, 3000, size=n),
+        t_reco=rng.uniform(0, 3000, size=n),
+        particle_idx=np.zeros(n, np.int64), segment_idx=np.zeros(n, np.int64),
+        emission_process=np.zeros(n, np.int64),
+        n_sensors=30, model=resolve_model_config("ski"), rng=rng)
+
+    n_digits = sd["PE"].size
+    # Every surviving digit clears the threshold ...
+    assert (sd["PE"] >= 0.25).all()
+    # ... and every digit_idx still indexes a real digit.
+    for tbl in (hits, seg):
+        if tbl["digit_idx"].size:
+            assert tbl["digit_idx"].min() >= 0
+            assert tbl["digit_idx"].max() < n_digits
 
 
 def test_photon_digit_idx_conserves_charge():
@@ -148,6 +189,28 @@ def test_apply_readout_resolution():
     pr2, tr2 = apply_readout_resolution(pe_true, t, resolve_model_config("ski"), _rng())
     assert not np.allclose(tr2, t)
     assert not np.allclose(pr2, pe_true) and (pr2 >= 0).all()
+
+
+def test_time_jitter_follows_the_digitised_charge():
+    """A photoelectron is timed by the pulse it produced: the jitter is evaluated on the
+    digitised charge (floored at the model's jitter_floor_pe), the charge the discriminator sees."""
+    model = resolve_model_config({"model": "ski", "tdc_ns": 0.0})
+    n = 400_000
+    q, t = apply_readout_resolution(np.ones(n), np.zeros(n), model, _rng())
+    q = q.astype(np.float64)
+    sigma = np.maximum(0.58, 0.33 + np.sqrt(10.0 / np.maximum(q, model["jitter_floor_pe"])))
+    for lo, hi in ((0.25, 0.5), (1.0, 1.5), (2.0, 3.0)):
+        m = (q >= lo) & (q < hi)
+        assert abs(np.std(t[m] / sigma[m]) - 1.0) < 0.02, (lo, hi, np.std(t[m] / sigma[m]))
+
+
+def test_single_pe_that_digitises_higher_is_timed_better():
+    n = 400_000
+    for name in ("ski", "hk"):
+        model = resolve_model_config({"model": name, "tdc_ns": 0.0})
+        q, t = apply_readout_resolution(np.ones(n), np.zeros(n), model, _rng())
+        low, high = t[(q >= 0.25) & (q < 0.5)], t[(q >= 2.0) & (q < 3.0)]
+        assert np.std(low) > 1.1 * np.std(high), (name, np.std(low), np.std(high))
 
 
 def test_decompose_basic_single_digit_and_conserves():
@@ -223,3 +286,52 @@ def _run_all():
 
 if __name__ == "__main__":
     _run_all()
+
+
+# --- per-photon scatter tag (fiTQun scattering table) -------------------------
+
+def test_indirect_flag_is_reported_per_photon():
+    """photon_step's 8th return marks scatter-or-reflection.
+
+    The fiTQun scattering table is scattered light over direct light from one
+    MC pass, split by this flag -- the reference's `isct`. Both branches of the
+    step must report it, and it must be a boolean that costs the forward result
+    nothing (see the byte-parity check in the commit that added it).
+    """
+    import inspect
+    from lucid.simulation import photon_step as ps
+
+    src = inspect.getsource(ps)
+    # Both the sampling and the differentiable path return it.
+    assert src.count("indirect") >= 4
+    assert "indirect = scatters | reflects" in src   # sampling path
+    assert "indirect = is_scat" in src               # differentiable path
+
+
+def test_resolve_first_detection_tags_only_detected_photons():
+    """The tag is meaningful only where a photon was actually detected."""
+    import jax.numpy as jnp
+    import jax
+    from lucid.simulation.sensor_response import _resolve_first_detection
+
+    # Two photons, one slot each: the first is detectable, the second is not.
+    flat_weights = jnp.array([1.0, 0.0])
+    flat_indices = jnp.array([3, 7])
+    flat_times = jnp.array([5.0, 5.0])
+    qe = jnp.array([1.0, 1.0])
+    flat_indirect = jnp.array([True, True])
+
+    detected, sensor_id, hit_time, indirect = _resolve_first_detection(
+        flat_weights, flat_indices, flat_times, n_photons=2,
+        per_photon_qe=qe, qe_key=jax.random.PRNGKey(0), threshold=1e-10,
+        flat_indirect=flat_indirect)
+
+    assert bool(detected[0]) and not bool(detected[1])
+    # An undetected photon is never tagged, whatever the propagation said.
+    assert bool(indirect[0]) and not bool(indirect[1])
+
+    # Omitting the tag keeps the old 3-value behaviour, all-False.
+    *_, none_dev = _resolve_first_detection(
+        flat_weights, flat_indices, flat_times, n_photons=2,
+        per_photon_qe=qe, qe_key=jax.random.PRNGKey(0), threshold=1e-10)
+    assert not bool(none_dev.any())

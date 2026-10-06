@@ -93,6 +93,22 @@ class ClusterAdapter(ABC):
                             sn_ordering: Optional[str] = None) -> str: ...
 
     @abstractmethod
+    def render_command_job(self, *, command: str, cell_dir: Path, job_name: str,
+                           log_stem: str, partition: str, use_gpu: bool = False,
+                           request_disk_mb: int = 4096,
+                           request_memory_mb: int = 0) -> str:
+        """Submit description for an arbitrary command run inside the container.
+
+        The stage-specific renderers above each bake in one entry point. Some
+        work is a short pipeline instead (the fiTQun Cherenkov-profile scan runs
+        PhotonSim on a generated macro, reduces the output, then deletes it),
+        which is a shell command, not a `lucid-run-job` invocation.
+
+        ``request_memory_mb`` overrides the cluster default for the merges that
+        hold a whole dense table in memory; 0 keeps the default.
+        """
+        raise NotImplementedError
+
     def render_train_run(self, *, run_dir: Path, run_name: str,
                          cli_args: str, slurm: Dict[str, str]) -> str: ...
 
@@ -262,6 +278,25 @@ class SlurmAdapter(ClusterAdapter):
             f"\necho \"Job ended: $(date)\"\n"
         )
         return header + body
+
+    def render_command_job(self, *, command, cell_dir, job_name, log_stem,
+                           partition, use_gpu=False, request_disk_mb=4096,
+                           request_memory_mb=0):
+        header = self._common_header(
+            partition=partition, job_name=job_name, cell_dir=cell_dir,
+            log_stem=log_stem,
+            cpus=self.env.get("DEFAULT_CPUS", "1"),
+            gpus="1" if use_gpu else self.env.get("DEFAULT_GPUS", "0"),
+            memory=(str(request_memory_mb) if request_memory_mb
+                    else self.env.get("DEFAULT_MEMORY", "16000")),
+            time=self.env.get("DEFAULT_TIME", "08:00:00"),
+        )
+        return header + (
+            f"\n{self._container_exec(use_gpu=use_gpu)} \\\n"
+            f"    {self.env['LUCID_IMAGE_PATH']} \\\n"
+            f"    bash -c '{command}'\n"
+            f"\necho \"Job ended: $(date)\"\n"
+        )
 
     def render_train_run(self, *, run_dir, run_name, cli_args, slurm):
         # train_siren has its own SLURM defaults (GPU job, longer wall),

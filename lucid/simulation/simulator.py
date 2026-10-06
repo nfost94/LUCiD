@@ -13,7 +13,8 @@ from lucid.utils import (
     smear_times, smear_charges_SK_like,
 )
 from lucid.detector_params import DetectorParams, ParticleParams, load_detector_params, load_physics_config
-from lucid.wavelength.medium import make_medium, load_qe_curve, qe_curve_bounds, _MATERIALS_DIR
+from lucid.wavelength import DEFAULT_WAVELENGTH_NM
+from lucid.wavelength.medium import make_medium, load_qe_curve, qe_curve_bounds, qe_curve_peak, _MATERIALS_DIR
 from lucid.wavelength.optical_model import evaluate_optical_model, OpticalArrays
 from lucid.wavelength.spectrum import (
     sample_cherenkov_wavelengths, build_qe_weighted_cherenkov_sampler,
@@ -32,7 +33,7 @@ from lucid.simulation.optics import (
 from lucid.simulation.photon_step import (
     photon_iteration_sample, make_photon_iteration_update_factors_safe,
 )
-from lucid.simulation.reflection import get_reflection_model
+from lucid.simulation.reflection import get_reflection_model, sensor_normal_reflectance
 from lucid.simulation.sensor_response import (
     make_hits_simulation, make_hits_data, make_hits_likelihood, make_hits_moments,
     make_hits_per_photon,
@@ -296,28 +297,28 @@ def setup_event_simulator(
     # ---- make_hits wrapper selection ----------------------------------------
     # Every wrapper accepts a trailing ``response`` bundle (gain, t0, spe_width, tts)
     # built from DetectorParams at call time; only the moments mode consumes it.
-    def _make_hits_aggregated(flat_weights, flat_indices, flat_times, num_sensors, qe_key, qe, qe_corrections, response=None, flat_segment_idx=None):
+    def _make_hits_aggregated(flat_weights, flat_indices, flat_times, num_sensors, qe_key, qe, qe_corrections, response=None, flat_segment_idx=None, flat_indirect=None):
         return make_hits_simulation(flat_weights, flat_indices, flat_times, num_sensors,
                                     qe=qe, qe_corrections=qe_corrections)
 
-    def _make_hits_per_photon(flat_weights, flat_indices, flat_times, num_sensors, qe_key, qe, qe_corrections, response=None, flat_segment_idx=None):
+    def _make_hits_per_photon(flat_weights, flat_indices, flat_times, num_sensors, qe_key, qe, qe_corrections, response=None, flat_segment_idx=None, flat_indirect=None):
         return make_hits_likelihood(flat_weights, flat_indices, flat_times, num_sensors,
                                     qe=qe, qe_corrections=qe_corrections)
 
-    def _make_hits_realistic(flat_weights, flat_indices, flat_times, num_sensors, qe_key, qe, qe_corrections, response=None, flat_segment_idx=None):
+    def _make_hits_realistic(flat_weights, flat_indices, flat_times, num_sensors, qe_key, qe, qe_corrections, response=None, flat_segment_idx=None, flat_indirect=None):
         tts = 0.0 if response is None else response[3]
         return make_hits_data(flat_weights, flat_indices, flat_times, num_sensors,
                               qe=qe, qe_corrections=qe_corrections,
                               rng_key=qe_key, tts=tts,
                               charge_resolution=sim_config.charge_resolution)
 
-    def _make_hits_moments(flat_weights, flat_indices, flat_times, num_sensors, qe_key, qe, qe_corrections, response=None, flat_segment_idx=None):
+    def _make_hits_moments(flat_weights, flat_indices, flat_times, num_sensors, qe_key, qe, qe_corrections, response=None, flat_segment_idx=None, flat_indirect=None):
         gain, t0, spe_width, tts = response
         return make_hits_moments(flat_weights, flat_indices, flat_times, num_sensors,
                                  qe=qe, qe_corrections=qe_corrections,
                                  gain=gain, spe_width=spe_width, t0=t0, tts=tts)
 
-    def _make_hits_per_segment(flat_weights, flat_indices, flat_times, num_sensors, qe_key, qe, qe_corrections, response=None, flat_segment_idx=None):
+    def _make_hits_per_segment(flat_weights, flat_indices, flat_times, num_sensors, qe_key, qe, qe_corrections, response=None, flat_segment_idx=None, flat_indirect=None):
         # Production: per-sensor totals + per-photon pass-through arrays (incl the
         # per-photon segment index) for the host-side per-(segment, sensor) groupby.
         tts = 0.0 if response is None else response[3]
@@ -336,7 +337,7 @@ def setup_event_simulator(
     if hit_mode == 'waveform':
         _wf_fn = build_make_hits_waveform(n_photons=n_photons, **_wf_cfg)
         def _make_hits_waveform(flat_weights, flat_indices, flat_times, num_sensors,
-                                qe_key, qe, qe_corrections, response=None, flat_segment_idx=None):
+                                qe_key, qe, qe_corrections, response=None, flat_segment_idx=None, flat_indirect=None):
             return _wf_fn(flat_weights, flat_indices, flat_times, num_sensors,
                           qe_key, qe, qe_corrections)
     elif hit_mode == 'waveform_expected':
@@ -346,7 +347,7 @@ def setup_event_simulator(
         _wf_exp_fn = build_make_hits_waveform_expected(
             n_photons=n_photons, **_wf_exp_cfg)
         def _make_hits_waveform_expected(flat_weights, flat_indices, flat_times, num_sensors,
-                                         qe_key, qe, qe_corrections, response=None, flat_segment_idx=None):
+                                         qe_key, qe, qe_corrections, response=None, flat_segment_idx=None, flat_indirect=None):
             return _wf_exp_fn(flat_weights, flat_indices, flat_times, num_sensors,
                               qe_key, qe, qe_corrections)
     elif hit_mode == 'shotgun_per_photon':
@@ -355,9 +356,9 @@ def setup_event_simulator(
             tts_sigma_ns=_wf_cfg['tts_sigma_ns'],
             smear_time=_wf_cfg['smear_time'])
         def _make_hits_shotgun_pp(flat_weights, flat_indices, flat_times, num_sensors,
-                                  qe_key, qe, qe_corrections, response=None, flat_segment_idx=None):
+                                  qe_key, qe, qe_corrections, response=None, flat_segment_idx=None, flat_indirect=None):
             return _pp_fn(flat_weights, flat_indices, flat_times, num_sensors,
-                          qe_key, qe, qe_corrections)
+                          qe_key, qe, qe_corrections, flat_indirect)
 
     _make_hits_fn = {
         'aggregated': _make_hits_aggregated,
@@ -440,6 +441,42 @@ def setup_event_simulator(
         _qe_sampler = None
         _mean_qe_c = None
 
+    # response.qe is the QE at the scalar reference wavelength: the value scalar mode
+    # applies to every photon, and the one _project_missing_scalars reads off the curve
+    # when a config gives no scalar. In wavelength mode the curve supplies only the
+    # wavelength dependence around it, so _get_optical_arrays divides the QE weights by
+    # qe_fn(λ_ref) and the call sites multiply by response.qe. A photon at λ is then
+    # detected with response.qe * qe_fn(λ) / qe_fn(λ_ref): exactly qe_fn(λ) for the
+    # projected scalar, and the two modes agree at λ_ref for any scalar.
+    _qe_ref = None
+    if _qe_fn is not None:
+        _qe_ref = float(_qe_fn(DEFAULT_WAVELENGTH_NM))
+        if not _qe_ref > 0.0:
+            raise ValueError(
+                f"QE curve {_qe_curve_path} is zero at the scalar reference wavelength "
+                f"({DEFAULT_WAVELENGTH_NM} nm), so response.qe cannot be anchored to it.")
+    elif wavelength_mode and spectrum is not None and spectrum.mean_qe is not None:
+        raise ValueError(
+            "A QE-weighted spectrum needs the physics_config's qe_curve: response.qe is "
+            f"the QE at {DEFAULT_WAVELENGTH_NM} nm, read off that curve.")
+
+    # A deposited photon converts at QE / (1 - R0) (see _common_propagation), a probability
+    # only while QE <= 1 - R0: QE counts photons arriving at the PMT, so it cannot exceed the
+    # fraction that is not reflected. Checkable here when the parameters are baked in.
+    if _default_dp is not None and not _is_volume:
+        _r0 = float(sensor_normal_reflectance(
+            reflection_fn, build_refl_params(_default_dp), jnp.asarray(reflection_wavelength)))
+        _qe_peak = (float(_default_dp.response.qe)
+                    * float(jnp.max(_default_dp.per_pmt.qe_corrections)))
+        if wavelength_mode and _qe_fn is not None:
+            _qe_peak *= (qe_curve_peak(_qe_curve_path) / _qe_ref
+                         * float(jnp.max(_default_dp.response.qe_dev)))
+        if not _qe_peak <= 1.0 - _r0:
+            raise ValueError(
+                f"Peak QE {_qe_peak:.4f} exceeds 1 - R0 = {1.0 - _r0:.4f}, R0 being the "
+                f"{reflection_model!r} sensor reflectance at normal incidence: QE counts "
+                "photons arriving at the PMT, so it cannot exceed the fraction not reflected.")
+
     def _get_optical_arrays(n, detector_params, key, wavelengths=None):
         """Compute per-photon (n,) scatter/absorption arrays and QE weights.
 
@@ -447,7 +484,7 @@ def setup_event_simulator(
         When wavelength_mode=False: broadcasts DetectorParams scalars.
 
         Returns (scatter_lengths, absorption_lengths, qe_weights, key).
-        qe_weights is (n,) or None.
+        qe_weights is (n,) relative to the QE at λ_ref (see _qe_ref), or None.
         """
         if wavelength_mode and _medium_wl is None:
             raise RuntimeError(
@@ -499,6 +536,8 @@ def setup_event_simulator(
                         if (spectrum is not None and spectrum.mean_qe is not None)
                         else _mean_qe_c)
         qe_weights = jnp.full(n, _collapse_qe) if sampled_via_qe_importance else oa.qe
+        if qe_weights is not None:
+            qe_weights = qe_weights / _qe_ref
         return oa.scatter_len, oa.mie_len, oa.abs_len, qe_weights, key
 
     # ================================================================
@@ -528,7 +567,8 @@ def setup_event_simulator(
         absorption_lengths : jnp.ndarray
             Per-photon absorption lengths, shape (n_rays,).
         qe_per_photon : jnp.ndarray
-            Per-photon quantum efficiency, shape (n_rays,).
+            Per-photon quantum efficiency for light arriving at a sensor, its reflection
+            included, shape (n_rays,).
         pos_grad_threshold : int
             Iteration threshold for position stop_gradient.
         make_hits_fn : callable
@@ -543,12 +583,23 @@ def setup_event_simulator(
         # wavelength is exact for monochromatic-laser calibration (the validated case); a
         # per-photon λ array can be threaded here later for broadband sources.
         refl_lam = jnp.asarray(reflection_wavelength)
+        # QE is per photon arriving at a PMT, its reflection included, as quoted at normal
+        # incidence. The photon step reflects first and deposits the rest, so a deposited
+        # photon converts at QE / (1 - R0), R0 the model's sensor reflectance at normal
+        # incidence. String telescopes have no reflection.
+        if not is_volume:
+            qe_per_photon = qe_per_photon / (
+                1.0 - sensor_normal_reflectance(reflection_fn, refl_params, refl_lam))
         qe_corrections = detector_params.per_pmt.qe_corrections
         g = detector_params.scattering.g
 
         from lucid.simulation.types import PhotonState
 
-        initial_survival = jnp.ones(n_rays)
+        # The surface detectors are closed (the ID blacksheet), so light emitted outside never
+        # reaches an ID sensor; a vertex shift, or a track's range, can put emission there.
+        # String telescopes are open media.
+        initial_survival = (jnp.ones(n_rays) if is_volume
+                            else get_inside_detector_flag(positions).astype(jnp.float32))
 
         def propagation_step(carry, i):
             state = carry
@@ -574,7 +625,8 @@ def setup_event_simulator(
                 key, subkey = jax.random.split(key)
                 rng_keys = jax.random.split(subkey, n_rays)
                 (new_positions, new_directions, new_times,
-                 per_dom_charges, continuing_factors, logp_increments) = jax.vmap(
+                 per_dom_charges, continuing_factors, logp_increments,
+                 step_indirect) = jax.vmap(
                     photon_step_volume,
                     in_axes=(0, 0, 0, 1, 1, 0, 0, 0, 0, 0, None, None)
                 )(state.positions, state.directions, state.times,
@@ -600,7 +652,10 @@ def setup_event_simulator(
                 new_state = PhotonState(
                     positions=next_pos, directions=next_dir, times=new_times,
                     survival=new_survival, key=key, log_p=new_log_p)
-                outputs = (updated_weights, sensor_indices, total_times.squeeze(-1))
+                # Same 4-tuple shape as the surface branch: the scan unpacks one
+                # output signature for both models.
+                outputs = (updated_weights, sensor_indices,
+                           total_times.squeeze(-1), step_indirect)
                 return new_state, outputs
 
             # ── Surface model (cylinder/sphere/box) — UNCHANGED, byte-identical ──
@@ -626,7 +681,7 @@ def setup_event_simulator(
             # step, 0.0 for the sampling step). PRE-step log_p drives the implicit deposit.
             (new_positions, new_directions, new_times,
              detect_probs, reflection_attenuations,
-             continuing_factors, logp_increments) = jax.vmap(
+             continuing_factors, logp_increments, step_indirect) = jax.vmap(
                 photon_update_fn,
                 in_axes=(0, 0, 0, 0, 0,
                          0, 0, None, None, 0,
@@ -674,7 +729,12 @@ def setup_event_simulator(
                 key=key,
                 log_p=new_log_p,
             )
-            outputs = (iter_weights, iter_indices, iter_times)
+            # step_indirect is a scan OUTPUT, not part of the carry: keeping it
+            # out of PhotonState leaves the carry pytree, its remat and the
+            # gradient path exactly as they were. A cumulative OR along the
+            # iteration axis afterwards gives "had already indirect", which is
+            # what the scattering table's direct/indirect split needs.
+            outputs = (iter_weights, iter_indices, iter_times, step_indirect)
             return new_state, outputs
 
         init_state = PhotonState(
@@ -687,12 +747,24 @@ def setup_event_simulator(
         )
         propagation_step_remat = jax.remat(propagation_step)
 
-        _, (all_weights, all_indices, all_times) = jax.lax.scan(
+        _, (all_weights, all_indices, all_times, all_indirect) = jax.lax.scan(
             propagation_step_remat, init_state, jnp.arange(K))
 
         flat_weights = all_weights.reshape(-1)
         flat_indices = all_indices.reshape(-1)
         flat_times = all_times.reshape(-1)
+
+        # Per-deposit "this photon had already left the straight line". A deposit
+        # made at step k belongs to a photon that indirect during steps 0..k-1,
+        # so this is the EXCLUSIVE prefix OR along the iteration axis -- inclusive
+        # would wrongly tag the step on which a photon both scattered and was
+        # detected. Broadcast over the candidate axis to match all_weights'
+        # (K, max_candidates, n_rays) layout before the same C-order reshape.
+        prior_indirect = jnp.concatenate(
+            [jnp.zeros((1,) + all_indirect.shape[1:], dtype=bool),
+             jnp.cumsum(all_indirect, axis=0)[:-1] > 0], axis=0)
+        flat_indirect = jnp.broadcast_to(
+            prior_indirect[:, None, :], all_weights.shape).reshape(-1)
 
         # Tile per-photon QE to match flat shape.
         # all_weights shape: (K, max_candidates_per_ray, n_rays), C-order reshape
@@ -710,7 +782,7 @@ def setup_event_simulator(
         flat_segment_idx = (segment_idx[photon_idx] if segment_idx is not None else None)
         return make_hits_fn(
             flat_weights, flat_indices, flat_times, num_sensors, qe_key, flat_qe, qe_corrections,
-            response, flat_segment_idx=flat_segment_idx)
+            response, flat_segment_idx=flat_segment_idx, flat_indirect=flat_indirect)
 
     # ================================================================
     # Mode-specific simulation functions
@@ -780,7 +852,7 @@ def setup_event_simulator(
         data_wavelengths = photon_data.get('wavelengths', None)
         scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, key = _get_optical_arrays(
             n_rays, detector_params, key, wavelengths=data_wavelengths)
-        # Per-photon QE: wavelength curve * scalar qe (passed to make_hits, not baked into weights)
+        # Per-photon QE: response.qe x the curve relative to λ_ref (passed to make_hits, not baked into weights)
         if qe_weights is not None:
             qe_per_photon = qe_weights * detector_params.response.qe
         else:
@@ -917,7 +989,7 @@ def setup_event_simulator(
         scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, key = _get_optical_arrays(
             Nphot, detector_params, opt_key)
 
-        # Per-photon QE: wavelength curve * scalar qe (passed to make_hits, not baked into weights)
+        # Per-photon QE: response.qe x the curve relative to λ_ref (passed to make_hits, not baked into weights)
         if qe_weights is not None:
             qe_per_photon = qe_weights * detector_params.response.qe
         else:
@@ -945,7 +1017,7 @@ def setup_event_simulator(
         scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, key = _get_optical_arrays(
             Nphot, detector_params, opt_key, wavelengths=wavelengths)
 
-        # Per-photon QE: wavelength curve * scalar qe (passed to make_hits, not baked into weights)
+        # Per-photon QE: response.qe x the curve relative to λ_ref (passed to make_hits, not baked into weights)
         if qe_weights is not None:
             qe_per_photon = qe_weights * detector_params.response.qe
         else:

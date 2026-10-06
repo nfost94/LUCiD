@@ -96,6 +96,8 @@ def photon_iteration_sample(
 
     u2 = jax.random.uniform(k2)
     reflects = reaches_surface & (u2 < reflection_rate)
+    # Not reflected -> deposited; make_hits converts it at QE / (1 - R0), since QE counts
+    # photons arriving at the PMT (see simulator._common_propagation).
     detects = reaches_surface & (u2 >= reflection_rate)
     scatters = ~reaches_surface
 
@@ -141,7 +143,15 @@ def photon_iteration_sample(
     # carries no score -> 0.0 (keeps the shared scan-body step signature consistent).
     logp_increment = jnp.zeros_like(new_time)
 
-    return new_pos, new_dir, new_time, detect_prob, reflection_attenuation, continuing_factor, logp_increment
+    # 8th return: did this step deviate the photon from a straight line? Scatter
+    # and reflection both count, matching what the fiTQun tuning chain calls
+    # "indirect" (WCSim's isct flag / killScatterRef kill both). Boolean, carries
+    # no gradient, and nothing else reads it -- it exists so the scattering-table
+    # reduction can split direct from indirect light per photon.
+    indirect = scatters | reflects
+
+    return (new_pos, new_dir, new_time, detect_prob, reflection_attenuation,
+            continuing_factor, logp_increment, indirect)
 
 
 def photon_iteration_update_factors(
@@ -272,7 +282,8 @@ def photon_iteration_update_factors(
 
     # Implicit-capture deposit factor (expected detected charge, Rao-Blackwellised over the
     # free-path decision). Dd LIVE → pathwise track gradient through `reach`/`atten_surf`.
-    # No qe (applied in make_hits); no dice_dep (the scan body multiplies it from PRE-step log_p).
+    # No qe (make_hits applies QE / (1 - R0), see simulator._common_propagation); no dice_dep
+    # (the scan body multiplies it from PRE-step log_p).
     reach = jnp.exp(-mu_tot * Dd)
     atten_surf = jnp.exp(-Dd / absorption_length)
     detect_prob = reach * (1.0 - refl_prob) * atten_surf
@@ -284,7 +295,13 @@ def photon_iteration_update_factors(
     distance_for_time = jnp.where(is_scat, d_live, Dd)
     new_time = time + distance_for_time / speed_of_light
 
-    return new_pos, new_dir, new_time, detect_prob, reflection_attenuation, continuing_factor, logp_increment
+    # See the sampling path: a boolean tag for the scattering-table reduction.
+    # This branch is a weighted/expectation step rather than a sampled one, so
+    # is_scat is the step's scatter decision; it carries no gradient either way.
+    indirect = is_scat
+
+    return (new_pos, new_dir, new_time, detect_prob, reflection_attenuation,
+            continuing_factor, logp_increment, indirect)
 
 
 # ===================================================================

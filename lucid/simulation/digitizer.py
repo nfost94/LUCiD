@@ -22,6 +22,9 @@ checkout. ``basic`` is the idealized passthrough (kept for backward parity);
     ski    window=200ns, deadtime=0, thr=0.25pe, dark=4.2kHz — SK 20" (WCSim PMT20inch)
     hk     window=200ns, deadtime=0, thr=0.25pe, dark=4.2kHz — HK 20" Box&Line (R12860)
 
+``thr`` is the discriminator, applied after charge smearing (see below), not
+during windowing.
+
 Provenance (all in ``WCSim/``, the checkout alongside LUCiD):
   * window 200 ns / deadtime 0 ns — ``include/WCSimWCDigitizer.hh:97-98`` (the
     only digitizer WCSim ships is SKI; there is no separate QBEE model).
@@ -29,10 +32,29 @@ Provenance (all in ``WCSim/``, the checkout alongside LUCiD):
     PMT's tabulated SPE CDF (``src/WCSimPMTObject.cc`` ``Getqpe``) to a
     Gaussian+exponential (Bellamy et al. 1994, NIM A 339 468); see ``_SPE_*``.
   * time = charge-dependent PMT jitter — ``src/WCSimPMTObject.cc`` HitTimeSmearing
-    (SK ``:88-99`` Gaussian; HK ``:2124-2138`` Gaussian+exp tail) + 0.4 ns TDC
-    truncation (``WCSimWCDigitizer.hh:99``).
+    (SK ``:88-99`` Gaussian; HK ``:2124-2138`` Gaussian+exp tail), evaluated on the
+    digitised charge floored at 0.5 p.e. (``src/WCSimWCDigitizer.cc:346``), + 0.4 ns
+    TDC truncation (``WCSimWCDigitizer.hh:99``).
   * dark rate 4.2 kHz — ``src/WCSimPMTObject.cc:262`` (SK-I; WCSim uses the same
     value for the HK B&L PMT, ``:2295``).
+
+Discriminator. ``threshold_pe`` is applied to the **digitised** charge, after
+the SPE spectrum has been sampled — a discriminator fires on the analogue
+pulse, so a single photoelectron whose charge fluctuates low is genuinely
+lost. Ordering it the other way (cutting on the integrated photoelectron
+count) makes the cut inert, since any hit sensor has at least one
+photoelectron; that yields ``P(hit|mu) = 1 - exp(-mu)`` exactly and leaves
+~18% of digits below the nominal threshold. The time jitter reads the same
+digitised charge, so a pulse that fluctuates low is also timed as one.
+
+WCSim instead applies a measured S-curve ``P(fire | charge)``
+(``WCSimWCDigitizerSKI::Threshold``), an SK-specific calibration inherited
+from SKDETSIM's ``skrn1pe`` with no derivation in the source. We deliberately
+keep a single sharp threshold at its 50% point: these are SK-*like*
+detectors, not SK, and one explicit number applies on the same terms to SK
+and HK. The PMT dependence then enters only where it should — through the
+SPE spectrum, which is broad for SK and narrow for HK, so the same cut keeps
+~77% of single-photoelectron hits in SK and ~92% in HK.
 
 The model is chosen from the detector physics config (a ``"digitizer"`` block);
 absent ⇒ ``basic``. Dark noise is off by default; when enabled it is generated
@@ -65,18 +87,21 @@ _SPE_HK = dict(w=0.2026, mu=1.1019, sig=0.3495, tau=0.5857, fit_mean=0.997)  # K
 # window/deadtime in ns; threshold in p.e.; dark_rate_khz per PMT.
 #   charge_model: "legacy" (basic → the old sk_like fractional smear, for parity)
 #                 or "spe"  (sample+sum the per-pe SPE spectrum in ``spe``).
-#   time_model:   "none" | "sk_gauss" | "hk_emg"  (charge-dependent PMT jitter);
-#                 tdc_ns is the electronics timing truncation applied after.
+#   time_model:   "none" | "sk_gauss" | "hk_emg"  (charge-dependent PMT jitter), evaluated
+#                 on the digitised charge floored at jitter_floor_pe; tdc_ns is the
+#                 electronics timing truncation applied after.
 MODEL_PRESETS: dict[str, dict] = {
     "basic": dict(integration_window_ns=None, deadtime_ns=0.0, threshold_pe=0.0,
                   charge_model="legacy", charge_res="sk_like",
                   time_model="none", tdc_ns=0.0, dark_rate_khz=0.0, provisional=False),
     "ski":  dict(integration_window_ns=200.0, deadtime_ns=0.0, threshold_pe=0.25,
                  charge_model="spe", spe=_SPE_SK,
-                 time_model="sk_gauss", tdc_ns=0.4, dark_rate_khz=4.2, provisional=False),
+                 time_model="sk_gauss", jitter_floor_pe=0.5, tdc_ns=0.4, dark_rate_khz=4.2,
+                 provisional=False),
     "hk":   dict(integration_window_ns=200.0, deadtime_ns=0.0, threshold_pe=0.25,
                  charge_model="spe", spe=_SPE_HK,
-                 time_model="hk_emg", tdc_ns=0.4, dark_rate_khz=4.2, provisional=False),
+                 time_model="hk_emg", jitter_floor_pe=0.5, tdc_ns=0.4, dark_rate_khz=4.2,
+                 provisional=False),
 }
 
 # emission_process encoding for the hits.h5 decomposition. 0/1 mirror
@@ -200,7 +225,9 @@ def digitize_event(
     win_raw = model.get("integration_window_ns")
     window = np.inf if win_raw is None else float(win_raw)
     deadtime = float(model.get("deadtime_ns", 0.0))
-    threshold = float(model.get("threshold_pe", 0.0))
+    # Windowing only keeps out empty windows; the discriminator is a readout
+    # stage and runs on the smeared charge (:func:`apply_discriminator`).
+    threshold = 0.0
 
     photon_digit_idx = np.full(n_ph, -1, dtype=np.int32)
     if n_ph == 0:
@@ -310,6 +337,8 @@ def _sample_time_jitter(digit_time: np.ndarray, digit_pe: np.ndarray,
                         model: dict, rng: np.random.Generator) -> np.ndarray:
     """Charge-dependent PMT time jitter + electronics TDC truncation.
 
+    ``digit_pe`` is the digitised charge, floored at the model's ``jitter_floor_pe``.
+
     ``sk_gauss`` — WCSim ``PMT20inch::HitTimeSmearing`` (``WCSimPMTObject.cc:88-99``):
         Gaussian, sigma = max(0.58, 0.33 + sqrt(10/Q)) ns.
     ``hk_emg``   — WCSim ``BoxandLine20inchHQE::HitTimeSmearing`` (``:2124-2138``):
@@ -320,7 +349,7 @@ def _sample_time_jitter(digit_time: np.ndarray, digit_pe: np.ndarray,
     t = np.asarray(digit_time, dtype=np.float64).copy()
     if t.size == 0:
         return t
-    Q = np.maximum(np.asarray(digit_pe, dtype=np.float64), 1e-6)
+    Q = np.maximum(np.asarray(digit_pe, dtype=np.float64), model.get("jitter_floor_pe", 1e-6))
     tm = model.get("time_model", "none")
     if tm == "sk_gauss":
         sig = np.maximum(0.58, 0.33 + np.sqrt(10.0 / Q))
@@ -339,6 +368,21 @@ def _sample_time_jitter(digit_time: np.ndarray, digit_pe: np.ndarray,
     return t
 
 
+def apply_discriminator(pe_reco: np.ndarray, model: dict) -> np.ndarray:
+    """Which digits survive the discriminator, given their **digitised** charge.
+
+    A discriminator fires on the analogue pulse, so this runs after the SPE
+    spectrum has been sampled -- see the module docstring for why the ordering
+    is load-bearing and why a single sharp threshold is preferred here over
+    WCSim's SK-specific S-curve.
+    """
+    threshold = float(model.get("threshold_pe", 0.0))
+    pe_reco = np.asarray(pe_reco)
+    if threshold <= 0.0:
+        return np.ones(pe_reco.shape, dtype=bool)
+    return pe_reco >= threshold
+
+
 def apply_readout_resolution(
     digit_pe_true: np.ndarray,
     digit_time: np.ndarray,
@@ -350,7 +394,8 @@ def apply_readout_resolution(
     ``charge_model="spe"`` (``ski``/``hk``) samples+sums the per-photoelectron
     SPE spectrum; ``"legacy"`` (``basic``) keeps the historical ``sk_like``
     fractional smear for byte-parity. Time gets the PMT's charge-dependent jitter
-    (:func:`_sample_time_jitter`), on top of the TTS already in ``digit_time``.
+    (:func:`_sample_time_jitter`) on the sampled charge, the pulse the discriminator also
+    sees, on top of the TTS already in ``digit_time``.
     Returns ``(pe_reco float32, t_reco _T_DTYPE=float64)`` — time stays float64 to
     avoid ULP collapse at supernova absolute times; do not narrow it to float32.
     """
@@ -362,7 +407,7 @@ def apply_readout_resolution(
     else:
         sigma = charge_resolution_sigma(pe_true, model.get("charge_res", "sk_like"))
         pe_reco = np.clip(pe_true + rng.normal(size=pe_true.shape) * sigma, 0.0, None)
-    t = _sample_time_jitter(digit_time, pe_true, model, rng)
+    t = _sample_time_jitter(digit_time, pe_reco, model, rng)
     return pe_reco.astype(np.float32), t.astype(_T_DTYPE)
 
 
@@ -508,13 +553,31 @@ def digitize_and_decompose(
         # digits carry true integrated charge and first-arrival time.
         pe_reco = res.digit_pe_true.astype(np.float32)
         t_reco_digit = res.digit_time.astype(_T_DTYPE)
+
+    # Discriminator: on the smeared charge, so a single photoelectron that
+    # fluctuates low is lost as it would be in hardware. Surviving digits are
+    # renumbered and every deposit's digit_idx remapped, so the decompositions
+    # below stay consistent foreign keys into sensor.h5.
+    keep = apply_discriminator(pe_reco, model)
+    digit_sensor = res.digit_sensor_idx
+    didx = res.photon_digit_idx
+    if not keep.all():
+        remap = np.full(keep.size, -1, dtype=np.int64)
+        remap[keep] = np.arange(int(keep.sum()), dtype=np.int64)
+        didx = didx.astype(np.int64).copy()
+        assigned = didx >= 0
+        didx[assigned] = remap[didx[assigned]]
+        didx = didx.astype(np.int32)
+        digit_sensor = digit_sensor[keep]
+        pe_reco = pe_reco[keep]
+        t_reco_digit = t_reco_digit[keep]
+
     sensor_digits = {
-        "sensor_idx": res.digit_sensor_idx.astype(np.uint16),
+        "sensor_idx": digit_sensor.astype(np.uint16),
         "PE": pe_reco,
         "T": t_reco_digit,
     }
 
-    didx = res.photon_digit_idx
     is_dark = emission_process == EMISSION_PROCESS_DARK
 
     # hits.h5: keep digit-assigned deposits with a real particle OR dark.
