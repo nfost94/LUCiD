@@ -180,7 +180,9 @@ def generate_events_from_photonsim_particles(event_simulator, root_file_path,
                                              primary_source='particles',
                                              pad_size_buckets=None,
                                              digitizer=None, trigger=None,
-                                             min_physics_hits=None):
+                                             min_physics_hits=None,
+                                             vertex_r_frac=0.9, vertex_z_frac=0.9,
+                                             vertex_avoid_pmts=False):
     """Generate events from a PhotonSim ROOT file, writing four-file batches.
 
     For each batch of events, writes four HDF5 files under ``output_dir``:
@@ -220,6 +222,14 @@ def generate_events_from_photonsim_particles(event_simulator, root_file_path,
     primary_source : str
         'particles' or 'genie'. Written into ``per_interaction/source_type``
         for every event of this batch.
+    vertex_r_frac, vertex_z_frac : float
+        With ``apply_translation``, the vertex is drawn uniformly within
+        r <= vertex_r_frac*R and |z| <= vertex_z_frac*H/2 (see
+        ``sample_translation_vector``). 1.0 reaches the wall; the 0.9 default
+        is the historical fiducial.
+    vertex_avoid_pmts : bool
+        Redraw any vertex landing inside a PMT (sensor_radius of the detector),
+        as the supernova path does. Useful when the vertex range reaches the wall.
 
     Notes
     -----
@@ -306,6 +316,9 @@ def generate_events_from_photonsim_particles(event_simulator, root_file_path,
     print(f"Using batch size of {batch_size} events for multithreaded I/O")
     print(f"Apply smearing: {apply_smearing}")
     print(f"Apply translation: {apply_translation}")
+    if apply_translation:
+        print(f"Vertex range: r <= {vertex_r_frac}*R, |z| <= {vertex_z_frac}*H/2, "
+              f"avoid PMTs: {vertex_avoid_pmts}")
     print(f"Digitizer model: {digitizer_model['model']} "
           f"(dark_rate_khz={digitizer_model.get('dark_rate_khz', 0.0)})")
     if min_physics_hits is not None:
@@ -427,7 +440,10 @@ def generate_events_from_photonsim_particles(event_simulator, root_file_path,
                 vertex_rng = np.random.default_rng(
                     seed=event_keys['vertex_seed'])
                 translation_vector = sample_translation_vector(
-                    detector_bounds, vertex_rng)
+                    detector_bounds, vertex_rng,
+                    r_frac=vertex_r_frac, z_frac=vertex_z_frac,
+                    sensor_positions=sensor_positions_np if vertex_avoid_pmts else None,
+                    pmt_radius=detector_bounds.get('sensor_radius', 0.25) if vertex_avoid_pmts else 0.0)
             else:
                 translation_vector = np.zeros(3, dtype=np.float32)
 

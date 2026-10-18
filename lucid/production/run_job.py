@@ -297,6 +297,11 @@ def _run_lucid(
     # Off by default — PhotonSim already throws isotropic directions. Enable to
     # re-emit the same Geant4 events at new orientations (augmentation).
     apply_rotation = bool(lucid_opts.get("apply_rotation", False))
+    # Vertex range for apply_translation, as fractions of the detector R and H/2
+    # (1.0 = right up to the wall); vertex_avoid_pmts redraws vertices inside a PMT.
+    vertex_r_frac = float(lucid_opts.get("vertex_r_frac", 0.9))
+    vertex_z_frac = float(lucid_opts.get("vertex_z_frac", 0.9))
+    vertex_avoid_pmts = bool(lucid_opts.get("vertex_avoid_pmts", False))
     # step/event_NNN/sensor_hits/ is mandatory for data-mode datasets:
     # it's the per-(segment, sensor) ground truth that the hits file is now
     # aggregated from. Photon_SegmentIndex is unconditional in PhotonSim
@@ -394,6 +399,9 @@ def _run_lucid(
         digitizer=digitizer_cfg,
         trigger=trigger_cfg,
         min_physics_hits=_read_min_physics_hits(config, default=None),
+        vertex_r_frac=vertex_r_frac,
+        vertex_z_frac=vertex_z_frac,
+        vertex_avoid_pmts=vertex_avoid_pmts,
     )
     print(f"LUCiD wrote {len(saved_files)} files under {output_dir}/{{sensor,hits,step,labl}}/")
 
