@@ -483,8 +483,10 @@ def setup_event_simulator(
         When wavelength_mode=True: uses medium coefficients at given wavelengths.
         When wavelength_mode=False: broadcasts DetectorParams scalars.
 
-        Returns (scatter_lengths, absorption_lengths, qe_weights, key).
+        Returns (scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, speeds, key).
         qe_weights is (n,) relative to the QE at λ_ref (see _qe_ref), or None.
+        speeds is (n,) group velocity c / n_g(λ) (m/ns) when the medium has a group-index
+        curve (wavelength mode), else None (every photon at the medium's speed).
         """
         if wavelength_mode and _medium_wl is None:
             raise RuntimeError(
@@ -494,7 +496,7 @@ def setup_event_simulator(
             # Monochromatic / scalar mode: the pure optical model broadcasts the
             # DetectorParams scalars (wavelengths=None path).
             oa = evaluate_optical_model(detector_params, None, _medium_wl, n)
-            return (oa.scatter_len, oa.mie_len, oa.abs_len, oa.qe, key)
+            return (oa.scatter_len, oa.mie_len, oa.abs_len, oa.qe, oa.speed, key)
 
         # --- λ sampling (a SOURCE concern; the optical model only evaluates) ---
         # Normalize wavelength input to per-photon array:
@@ -538,7 +540,7 @@ def setup_event_simulator(
         qe_weights = jnp.full(n, _collapse_qe) if sampled_via_qe_importance else oa.qe
         if qe_weights is not None:
             qe_weights = qe_weights / _qe_ref
-        return oa.scatter_len, oa.mie_len, oa.abs_len, qe_weights, key
+        return oa.scatter_len, oa.mie_len, oa.abs_len, qe_weights, oa.speed, key
 
     # ================================================================
     # Core propagation (shared by all modes)
@@ -555,7 +557,7 @@ def setup_event_simulator(
             n_rays, detector_params, key,
             num_sensors, K, n_grad_iters, max_candidates_per_ray,
             propagate_fn, photon_update_fn,
-            pos_grad_threshold, make_hits_fn, is_volume=False, segment_idx=None):
+            pos_grad_threshold, make_hits_fn, is_volume=False, segment_idx=None, speeds=None):
         """Core photon propagation loop.
 
         Parameters
@@ -573,6 +575,9 @@ def setup_event_simulator(
             Iteration threshold for position stop_gradient.
         make_hits_fn : callable
             Sensor response aggregation function.
+        speeds : jnp.ndarray or None
+            Per-photon propagation speed (m/ns), shape (n_rays,), e.g. the group velocity
+            c / n_g(λ). None: every photon travels at the medium's speed.
         """
 
         # Packed reflection params for the pluggable reflection model (default scalar_mix →
@@ -592,6 +597,9 @@ def setup_event_simulator(
                 1.0 - sensor_normal_reflectance(reflection_fn, refl_params, refl_lam))
         qe_corrections = detector_params.per_pmt.qe_corrections
         g = detector_params.scattering.g
+        # Per-photon speed for every distance -> time conversion below (the medium's single
+        # speed when none is given, which leaves the times unchanged).
+        photon_speeds = jnp.full(n_rays, SPEED_OF_LIGHT_MATERIAL) if speeds is None else speeds
 
         from lucid.simulation.types import PhotonState
 
@@ -628,11 +636,11 @@ def setup_event_simulator(
                  per_dom_charges, continuing_factors, logp_increments,
                  step_indirect) = jax.vmap(
                     photon_step_volume,
-                    in_axes=(0, 0, 0, 1, 1, 0, 0, 0, 0, 0, None, None)
+                    in_axes=(0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, None)
                 )(state.positions, state.directions, state.times,
                   sensor_distances.squeeze(-1), depositions,
                   scatter_lengths, mie_scatter_lengths, absorption_lengths, seg_lengths,
-                  rng_keys, SPEED_OF_LIGHT_MATERIAL, g)
+                  rng_keys, photon_speeds, g)
 
                 inside_detector = get_inside_detector_flag(new_positions)
                 safe_continuing = jnp.where(inside_detector, continuing_factors, 0.0)
@@ -644,7 +652,7 @@ def setup_event_simulator(
                 dice_dep = jnp.exp(state.log_p - jax.lax.stop_gradient(state.log_p))   # (n_rays,)
                 physical_intensities = intensities * state.survival * dice_dep
                 updated_weights = per_dom_charges.T * physical_intensities[None, :]
-                total_times = sensor_distances / SPEED_OF_LIGHT_MATERIAL + state.times[:, None]
+                total_times = sensor_distances / photon_speeds[:, None] + state.times[:, None]
 
                 next_pos = jnp.where(i < pos_grad_threshold, new_positions, jax.lax.stop_gradient(new_positions))
                 next_dir = jnp.where(i < n_grad_iters, new_directions, jax.lax.stop_gradient(new_directions))
@@ -685,12 +693,12 @@ def setup_event_simulator(
                 photon_update_fn,
                 in_axes=(0, 0, 0, 0, 0,
                          0, 0, None, None, 0,
-                         0, None, 0, None)
+                         0, None, 0, 0)
             )(state.positions, state.directions, state.times,
               surface_distances, normals,
               scatter_lengths, mie_scatter_lengths, g, refl_params,
               absorption_lengths,
-              hit_sensor, refl_lam, rng_keys, SPEED_OF_LIGHT_MATERIAL)
+              hit_sensor, refl_lam, rng_keys, photon_speeds)
 
             inside_detector = get_inside_detector_flag(new_positions)
             safe_continuing = jnp.where(inside_detector, continuing_factors, 0.0)
@@ -704,7 +712,7 @@ def setup_event_simulator(
             dice_dep = jnp.exp(state.log_p - jax.lax.stop_gradient(state.log_p))   # (n_rays,)
             detected_factors = detect_probs * reflection_attenuations * dice_dep
             updated_weights = depositions * physical_intensities[None, :] * detected_factors[None, :]
-            times_ns = hit_times_meters / SPEED_OF_LIGHT_MATERIAL
+            times_ns = hit_times_meters / photon_speeds[:, None]
             total_times = times_ns + state.times[:, None]
 
             iter_weights = updated_weights
@@ -850,7 +858,7 @@ def setup_event_simulator(
 
         # Per-photon optical properties — use PhotonSim wavelengths if available
         data_wavelengths = photon_data.get('wavelengths', None)
-        scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, key = _get_optical_arrays(
+        scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, speeds, key = _get_optical_arrays(
             n_rays, detector_params, key, wavelengths=data_wavelengths)
         # Per-photon QE: response.qe x the curve relative to λ_ref (passed to make_hits, not baked into weights)
         if qe_weights is not None:
@@ -870,7 +878,7 @@ def setup_event_simulator(
             n_rays, detector_params, key, NUM_SENSORS, sim_config.K, sim_config.effective_n_grad_iters, max_candidates_per_ray,
             propagate_photons, photon_update_fn,
             pos_grad_threshold=_pgt, make_hits_fn=_make_hits_fn, is_volume=_is_volume,
-            segment_idx=_segment_idx)
+            segment_idx=_segment_idx, speeds=speeds)
 
     # SIREN config: model path + ray-sampling knobs. The s/s_max-trained net carries its
     # own count/range model (nphot/smax) in the trained-model metadata, read in the context.
@@ -957,7 +965,8 @@ def setup_event_simulator(
             photon_times = jnp.concatenate(parts_times)
             wavelengths = jnp.concatenate(parts_wls)
 
-            scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, key = _get_optical_arrays(
+            # Track mode keeps the medium's single speed: its emission-time model is built on it.
+            scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, _, key = _get_optical_arrays(
                 _n_total, detector_params, opt_key, wavelengths=wavelengths)
             if qe_weights is not None:
                 qe_per_photon = qe_weights * detector_params.response.qe
@@ -985,8 +994,9 @@ def setup_event_simulator(
         t0 = jax.lax.stop_gradient(_pt0(distances_to_vertex, energy,
                                         jnp.asarray(a_c), jnp.asarray(l_c), jnp.asarray(b_c)))
 
-        # Per-photon optical properties (Cherenkov spectrum when wavelength_mode)
-        scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, key = _get_optical_arrays(
+        # Per-photon optical properties (Cherenkov spectrum when wavelength_mode). Track mode keeps
+        # the medium's single speed: its emission-time model t0 is built on it.
+        scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, _, key = _get_optical_arrays(
             Nphot, detector_params, opt_key)
 
         # Per-photon QE: response.qe x the curve relative to λ_ref (passed to make_hits, not baked into weights)
@@ -1014,7 +1024,8 @@ def setup_event_simulator(
         # Source wavelength can be None (→ Cherenkov), scalar, or (Nphot,) array;
         # _get_optical_arrays normalizes the shape.
         wavelengths = getattr(source, 'wavelength', None)
-        scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, key = _get_optical_arrays(
+        # Calibration keeps the medium's single speed (existing calibration timing studies use it).
+        scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, _, key = _get_optical_arrays(
             Nphot, detector_params, opt_key, wavelengths=wavelengths)
 
         # Per-photon QE: response.qe x the curve relative to λ_ref (passed to make_hits, not baked into weights)

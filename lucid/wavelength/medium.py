@@ -41,6 +41,11 @@ class MediumProperties(NamedTuple):
     scintillation_lambda_max: float = 550.0
     cherenkov_fraction: float = 0.5                     # n_photons split when both processes run
 
+    # Group index n_g(lambda) = n - lambda dn/dlambda on wavelength_grid, from the material's
+    # tabulated refractive_index_curve (None = no table: photons propagate at speed_of_light).
+    # APPENDED LAST for the same positional-construction reason as above.
+    group_index_curve: Optional[jnp.ndarray] = None     # (N,)
+
 
 # ---------------------------------------------------------------------------
 # QE curve loading
@@ -212,6 +217,18 @@ def make_medium(material: str = "water",
     C = (1.0 - _s) * C_powerlaw + _s * C_popefry
     alpha_abs = P0 * P1 / (wl ** 4) + C
 
+    # Refractive index: the tabulated n(lambda) when the material has one, and its group index
+    # n_g = n - lambda dn/dlambda (Geant4's GROUPVEL from RINDEX) for the photon speed c / n_g;
+    # otherwise the constant n, and photons keep the single speed c / n.
+    n_curve, ng_curve = jnp.full_like(wl, n), None
+    ri = data.get("refractive_index_curve")
+    if ri is not None:
+        tab_wl = np.asarray(ri["wavelengths_nm"], dtype=np.float64)
+        tab_n = np.asarray(ri["n"], dtype=np.float64)
+        tab_ng = tab_n - tab_wl * np.gradient(tab_n, tab_wl)
+        n_curve = jnp.interp(wl, jnp.asarray(tab_wl, dtype=jnp.float32), jnp.asarray(tab_n, dtype=jnp.float32))
+        ng_curve = jnp.interp(wl, jnp.asarray(tab_wl, dtype=jnp.float32), jnp.asarray(tab_ng, dtype=jnp.float32))
+
     return MediumProperties(
         material=material,
         refractive_index=n,
@@ -219,7 +236,8 @@ def make_medium(material: str = "water",
         wavelength_grid=wl,
         scatter_coeff=alpha_sym,
         absorption_coeff=alpha_abs,
-        refractive_index_curve=jnp.full_like(wl, n),  # constant n for now
+        refractive_index_curve=n_curve,
+        group_index_curve=ng_curve,
         mie_scatter_coeff=alpha_asym,
         mie_asymmetry=g,
         **scint_kwargs,

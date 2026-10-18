@@ -55,11 +55,14 @@ class OpticalArrays(NamedTuple):
     mie_len : jnp.ndarray       (n,) Mie scattering length, m
     abs_len : jnp.ndarray       (n,) absorption length, m
     qe : jnp.ndarray or None    (n,) per-photon QE weight, or None in scalar mode
+    speed : jnp.ndarray or None (n,) propagation speed c / n_g(λ), m/ns, in wavelength mode when
+                                the medium has a group-index curve; None = the medium's single speed
     """
     scatter_len: jnp.ndarray
     mie_len: jnp.ndarray
     abs_len: jnp.ndarray
     qe: Optional[jnp.ndarray]
+    speed: Optional[jnp.ndarray] = None
 
 
 def evaluate_optical_model(detector_params, wavelengths, medium, n_photons,
@@ -130,9 +133,16 @@ def evaluate_optical_model(detector_params, wavelengths, medium, n_photons,
     if qe_fn is not None:
         qe = qe_fn(wl) * _deviation(wl, control_lambda, rp.qe_dev)
 
+    # Group velocity c / n_g(λ), c = the medium's speed × its scalar index (the vacuum speed).
+    speed = None
+    if medium.group_index_curve is not None:
+        c_vacuum = medium.speed_of_light * medium.refractive_index
+        speed = c_vacuum / jnp.interp(wl, medium.wavelength_grid, medium.group_index_curve)
+
     return OpticalArrays(
         scatter_len=(1.0 / (sc + 1e-30)) / dev_r,
         mie_len=(1.0 / (asym + 1e-30)) / dev_m,
         abs_len=(1.0 / (ac + 1e-30)) / dev_a,
         qe=qe,
+        speed=speed,
     )
