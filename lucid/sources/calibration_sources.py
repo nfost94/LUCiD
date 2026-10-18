@@ -355,7 +355,7 @@ def laser_source(position, intensity=1_000_000, direction=None, fiber_NA=0.22,
 
 
 # ---------------------------------------------------------------------------
-# Measured-profile source, ported from HKUKLI/measured_profile_source_job.py.
+# Measured-profile source, ported from HKUKLI/deprecated/measured_profile_source_job.py.
 # ---------------------------------------------------------------------------
 
 def _axis_angle_from_x_axis(direction):
@@ -410,8 +410,8 @@ class MeasuredProfileSource(NamedTuple):
     """Calibration source drawn from a real goniometer profile scan -- callable JAX pytree.
 
     Usage: ``source(n_photons, key)`` or ``source(n_photons, key, n_water)``.
-    Built via `measured_profile_source`; see HKUKLI/injector_profile_comparison.ipynb
-    and HKUKLI/measured_profile_source_job.py for derivation/validation.
+    Built via `measured_profile_source`; see HKUKLI/deprecated/injector_profile_comparison.ipynb
+    and HKUKLI/deprecated/measured_profile_source_job.py for derivation/validation.
     """
     position: jnp.ndarray
     rotation_axis: jnp.ndarray
@@ -459,7 +459,7 @@ def fitted_profile_source(position, direction, params, alpha_max,
     """Build a MeasuredProfileSource from an already-fitted composite(w,p,a0,s) model
     instead of a measured grid -- phi-uniform, so is_collimator=False (the pole-embedding
     convention alpha already assumes). params/alpha_max come from
-    HKUKLI/injector_profile_comparison.ipynb's `fit_common_profile` (PyROOT/Minuit2 --
+    HKUKLI/deprecated/injector_profile_comparison.ipynb's `fit_common_profile` (PyROOT/Minuit2 --
     run offline, not here).
     """
     fine_u, marginal_cdf, fine_phi, cond = build_fit_cdf(params, alpha_max)
