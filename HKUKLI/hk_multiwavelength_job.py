@@ -13,8 +13,12 @@ import time
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--gpu', default='2', help='CUDA_VISIBLE_DEVICES value')
-    ap.add_argument('--out', default='hk_multiwavelength_results.npz')
+    ap.add_argument('--out', default='results/hk_multiwavelength_results.npz')
     ap.add_argument('--seed', type=int, default=0, help='fit start and fit key streams')
+    ap.add_argument('--resume', default=None,
+                    help="start from this results .npz's fit instead of the perturbed start. A "
+                         "continuation only if the truth settings (TRUTH_DRAWS, N_RAYS, INJ_IDX, "
+                         "optics, QE, INTENSITY) are unchanged; use a new --seed. STEPS = extra steps")
     args = ap.parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     t_start = time.perf_counter()
@@ -40,7 +44,8 @@ def main():
     FIT_SPECULAR_FRACTIONS = False                       # False: hold f_w, f_s at truth
     QE_SPREAD = 0.05                                     # truth per-PMT gain spread (paper value)
     # paper recipe (calib_run.run_seed defaults)
-    STEPS, REFRESH, JACOBIAN_DRAWS, TRUTH_DRAWS, POLYAK = 200, 20, 8, 8, 50
+    STEPS, REFRESH, JACOBIAN_DRAWS, TRUTH_DRAWS, POLYAK = 200, 20, 8, 100, 50
+
     # Forward draws averaged per step: the profiled gains are nonlinear in the forward, so its MC
     # noise biases the fixed point ~1/N_FORWARD (CalibrationForward.average). Paper: 1.
     N_FORWARD = 4
@@ -100,6 +105,12 @@ def main():
         start[3 * w] = theta_true[3 * w] + rng.uniform(-PERT_SCATTER, PERT_SCATTER)
     for j in range(NG, P):
         start[j] = theta_true[j] + rng.uniform(-PERT_REFL, PERT_REFL)
+    if args.resume:
+        f = np.load(args.resume)['fit']                  # physical values, ordered as `names`
+        start = np.asarray(params.theta_from_physical(
+            [dict(scatter_length=f[3 * w], absorption_length=f[3 * w + 1], qe=f[3 * w + 2])
+             for w in range(W)], *f[NG:NG + 4]), dtype=float)
+        print(f'resuming from {args.resume}', flush=True)
     fix = () if FIT_SPECULAR_FRACTIONS else (NG + 1, NG + 3)
     for j in fix:
         start[j] = theta_true[j]

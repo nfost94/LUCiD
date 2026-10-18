@@ -19,7 +19,7 @@ WCSIM_395NM = dict(
     g=0.4,
     wall_reflection_rate=0.1125,
     sensor_reflection_rate=0.32,
-    qe=0.331,
+    qe=0.4072,
 )
 
 
@@ -27,12 +27,12 @@ WCSIM_395NM = dict(
 # Blacksheet reflectivity is 0.1125 up to 395 nm but 0.145 / 0.1375 at 440 / 500 nm; the
 # multi-wavelength fit (CalibrationParams) shares one reflection model across wavelengths.
 WCSIM_BY_WAVELENGTH = {
-    337: dict(scatter_length=56.9, absorption_length=830.7, qe=0.3145),
-    355: dict(scatter_length=73.8, absorption_length=853.4, qe=0.3324),
-    375: dict(scatter_length=96.6, absorption_length=768.1, qe=0.3337),
-    395: dict(scatter_length=124.3, absorption_length=599.3, qe=0.3311),
-    440: dict(scatter_length=208.1, absorption_length=247.4, qe=0.2804),
-    500: dict(scatter_length=378.6, absorption_length=62.8, qe=0.1818),
+    337: dict(scatter_length=56.9, absorption_length=830.7, qe=0.3065),
+    355: dict(scatter_length=73.8, absorption_length=853.4, qe=0.3689),
+    375: dict(scatter_length=96.6, absorption_length=768.1, qe=0.4005),
+    395: dict(scatter_length=124.3, absorption_length=599.3, qe=0.4072),
+    440: dict(scatter_length=208.1, absorption_length=247.4, qe=0.3632),
+    500: dict(scatter_length=378.6, absorption_length=62.8, qe=0.2288),
 }
 
 
