@@ -428,34 +428,38 @@ def test_charge_pdf_occupancy_follows_poisson_times_the_discriminator(tmp_path):
     """P(hit|mu) must sit *below* the Poisson curve by the discriminator loss.
 
     A PMT fires if it gets at least one photoelectron AND the digitised charge
-    clears the threshold. If the cut were applied to the photoelectron count
+    fires the discriminator. If the cut were applied to the photoelectron count
     instead, it would be inert and this would come out exactly 1 - exp(-mu) --
     which is the bug this pins against.
     """
     from lucid.production.fitqun import chargepdf
-    from lucid.simulation.digitizer import _sample_spe_charge, resolve_model_config
+    from lucid.simulation.digitizer import (_sample_spe_charge, discriminator_efficiency,
+                                            resolve_model_config)
 
     model = resolve_model_config("ski")
     rng = np.random.default_rng(11)
     for mu in (0.5, 5.0):
-        # Independent expectation: Poisson occupancy times the SPE survival
-        # fraction at that photoelectron multiplicity.
+        # Independent expectation: Poisson occupancy times the discriminator's
+        # firing probability on the SPE charge at that photoelectron multiplicity.
         n = rng.poisson(mu, 400_000)
         q = np.zeros(n.size)
         q[n > 0] = _sample_spe_charge(n[n > 0].astype(float), model["spe"], rng)
-        expected = (q >= model["threshold_pe"]).mean()
+        expected = np.where(n > 0, discriminator_efficiency(q, model), 0.0).mean()
         assert expected < 1.0 - np.exp(-mu)          # the cut really bites
 
         res = chargepdf.build(mu, n_pmt=4000, n_events=8, model="ski", seed=7)
         assert res["n_hits"] / res["n_active"] == pytest.approx(expected, abs=0.01)
 
-    # Charges below the discriminator must not appear in the table at all.
+    # Low charges are thinned by the discriminator, not removed: the table keeps
+    # some charge below 0.25 p.e., but a smaller share than the SPE spectrum has.
     path = chargepdf.write_mu_point(tmp_path, 0.5, n_pmt=4000, n_events=8,
                                     model="ski", seed=7)
     with uproot.open(path) as f:
         h = f["hchpdf2"]
         edges, values = h.axis().edges(), h.values()
-        assert values[edges[1:] <= model["threshold_pe"]].sum() == 0
+        low = values[edges[1:] <= 0.25].sum() / values.sum()
+        spe = _sample_spe_charge(np.ones(400_000), model["spe"], rng)
+        assert 0.0 < low < np.mean(spe < 0.25)
         ctr = f["hctr"].values()
         assert ctr[1] == ctr[2] == 4000 * 8 and ctr[9] == ctr[1] + ctr[2]
 
@@ -480,7 +484,7 @@ def test_charge_pdf_batching_preserves_the_distribution():
 
     assert batched.size == pytest.approx(one_pass.size, rel=0.05)
     assert batched.mean() == pytest.approx(one_pass.mean(), rel=0.05)
-    assert (batched >= model["threshold_pe"]).all()
+    assert np.mean(batched < 0.25) == pytest.approx(np.mean(one_pass < 0.25), abs=0.01)
 
 
 def test_charge_pdf_rejects_a_model_without_an_spe_spectrum():

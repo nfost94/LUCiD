@@ -18,12 +18,12 @@ reference simulation); citations are ``WCSim/...`` paths, verifiable in the
 checkout. ``basic`` is the idealized passthrough (kept for backward parity);
 ``ski`` and ``hk`` are physical models differing in their PMT response:
 
-    basic  window=inf,  deadtime=0, thr=0     — legacy first-arrival + summed charge
-    ski    window=200ns, deadtime=0, thr=0.25pe, dark=4.2kHz — SK 20" (WCSim PMT20inch)
-    hk     window=200ns, deadtime=0, thr=0.25pe, dark=4.2kHz — HK 20" Box&Line (R12860)
+    basic  window=inf,  deadtime=0, no discriminator   — legacy first-arrival + summed charge
+    ski    window=200ns, deadtime=0, WCSim discriminator, dark=4.2kHz — SK 20" (WCSim PMT20inch)
+    hk     window=200ns, deadtime=0, WCSim discriminator, dark=4.2kHz — HK 20" Box&Line (R12860)
 
-``thr`` is the discriminator, applied after charge smearing (see below), not
-during windowing.
+The discriminator is applied after charge smearing (see below), not during
+windowing.
 
 Provenance (all in ``WCSim/``, the checkout alongside LUCiD):
   * window 200 ns / deadtime 0 ns — ``include/WCSimWCDigitizer.hh:97-98`` (the
@@ -38,23 +38,27 @@ Provenance (all in ``WCSim/``, the checkout alongside LUCiD):
   * dark rate 4.2 kHz — ``src/WCSimPMTObject.cc:262`` (SK-I; WCSim uses the same
     value for the HK B&L PMT, ``:2295``).
 
-Discriminator. ``threshold_pe`` is applied to the **digitised** charge, after
-the SPE spectrum has been sampled — a discriminator fires on the analogue
-pulse, so a single photoelectron whose charge fluctuates low is genuinely
-lost. Ordering it the other way (cutting on the integrated photoelectron
-count) makes the cut inert, since any hit sensor has at least one
-photoelectron; that yields ``P(hit|mu) = 1 - exp(-mu)`` exactly and leaves
-~18% of digits below the nominal threshold. The time jitter reads the same
-digitised charge, so a pulse that fluctuates low is also timed as one.
+Discriminator. It acts on the **digitised** charge, after the SPE spectrum has
+been sampled — a discriminator fires on the analogue pulse, so a single
+photoelectron whose charge fluctuates low is genuinely lost. Ordering it the
+other way (cutting on the integrated photoelectron count) makes the cut inert,
+since any hit sensor has at least one photoelectron; that yields
+``P(hit|mu) = 1 - exp(-mu)`` exactly. The time jitter reads the same digitised
+charge, so a pulse that fluctuates low is also timed as one.
 
-WCSim instead applies a measured S-curve ``P(fire | charge)``
-(``WCSimWCDigitizerSKI::Threshold``), an SK-specific calibration inherited
-from SKDETSIM's ``skrn1pe`` with no derivation in the source. We deliberately
-keep a single sharp threshold at its 50% point: these are SK-*like*
-detectors, not SK, and one explicit number applies on the same terms to SK
-and HK. The PMT dependence then enters only where it should — through the
-SPE spectrum, which is broad for SK and narrow for HK, so the same cut keeps
-~77% of single-photoelectron hits in SK and ~92% in HK.
+The cut is WCSim's: a digit fires with probability ``P(fire | q)``, the S-curve
+of ``WCSimWCDigitizerSKI::Threshold`` (``include/WCSimWCDigitizer.hh:102-123``,
+inherited from SKDETSIM), rising from 11% at 0.1 p.e. through 54% at 0.25 p.e.
+to 1 above 1 p.e. of raw SPE-table charge (see :func:`discriminator_efficiency`).
+WCSim also adds 0.03 p.e. of Gaussian noise to a digit that fires; that is
+omitted here, beside an SPE width of ~0.45 p.e. The same curve keeps ~73% of
+single-photoelectron hits in SK and ~90% in HK, through the SPE spectra.
+
+Charge precision. WCSim stores each digit's charge truncated to a multiple of
+``PEPrecision`` (``AddNewDigit``, ``src/WCSimWCDigitizer.cc:132``), after the
+discriminator has decided on the full charge, so a digit below one step is
+kept with charge 0. ``pe_precision`` is that step: 0 (no truncation, WCSim's
+default) in every preset; a detector config sets its macro's value.
 
 The model is chosen from the detector physics config (a ``"digitizer"`` block);
 absent ⇒ ``basic``. Dark noise is off by default; when enabled it is generated
@@ -81,25 +85,36 @@ import numpy as np
 # out so reco charge is unbiased (mean = photoelectron count) while the *shape*
 # (resolution) is preserved. KS vs the tabulated LUT quoted per PMT.
 _SPE_SK = dict(w=0.2970, mu=1.1288, sig=0.5587, tau=0.1978, fit_mean=0.852)  # KS 5.1%
-_SPE_HK = dict(w=0.2026, mu=1.1019, sig=0.3495, tau=0.5857, fit_mean=0.997)  # KS 1.0%
+# HK: minimum-KS fit to BoxandLine20inchHQE::Getqpe's piecewise-linear CDF (rn1pe draws uniformly in
+# bins of 1/22.83 p.e.). Table: mean 1.020, rms 0.441, 6.6% below 0.25 p.e.; fit: 1.024, 0.453, 7.0%.
+_SPE_HK = dict(w=0.1580, mu=1.1215, sig=0.3690, tau=0.5006, fit_mean=1.0235)  # KS 0.8%
+
+# --- Discriminator -----------------------------------------------------------
+# WCSimWCDigitizerSKI::Threshold (include/WCSimWCDigitizer.hh:102-123): P(fire | q) is this
+# polynomial in x = q + 0.1 below x = 1.1, capped at 1, and 1 above, where q is the raw
+# SPE-table charge. Coefficients lowest order first.
+_SKI_THRESHOLD = (-0.06374, 3.748, -63.23, 452.0, -1449.0, 2513.0,
+                  -2529.0, 1472.0, -452.2, 51.34, 2.370)
 
 # --- Model presets -----------------------------------------------------------
-# window/deadtime in ns; threshold in p.e.; dark_rate_khz per PMT.
+# window/deadtime in ns; pe_precision in p.e.; dark_rate_khz per PMT.
+#   threshold_curve: discriminator S-curve coefficients (``_SKI_THRESHOLD``), or None
+#                 for no discriminator.
 #   charge_model: "legacy" (basic → the old sk_like fractional smear, for parity)
 #                 or "spe"  (sample+sum the per-pe SPE spectrum in ``spe``).
 #   time_model:   "none" | "sk_gauss" | "hk_emg"  (charge-dependent PMT jitter), evaluated
 #                 on the digitised charge floored at jitter_floor_pe; tdc_ns is the
 #                 electronics timing truncation applied after.
 MODEL_PRESETS: dict[str, dict] = {
-    "basic": dict(integration_window_ns=None, deadtime_ns=0.0, threshold_pe=0.0,
-                  charge_model="legacy", charge_res="sk_like",
+    "basic": dict(integration_window_ns=None, deadtime_ns=0.0, threshold_curve=None,
+                  charge_model="legacy", charge_res="sk_like", pe_precision=0.0,
                   time_model="none", tdc_ns=0.0, dark_rate_khz=0.0, provisional=False),
-    "ski":  dict(integration_window_ns=200.0, deadtime_ns=0.0, threshold_pe=0.25,
-                 charge_model="spe", spe=_SPE_SK,
+    "ski":  dict(integration_window_ns=200.0, deadtime_ns=0.0, threshold_curve=_SKI_THRESHOLD,
+                 charge_model="spe", spe=_SPE_SK, pe_precision=0.0,
                  time_model="sk_gauss", jitter_floor_pe=0.5, tdc_ns=0.4, dark_rate_khz=4.2,
                  provisional=False),
-    "hk":   dict(integration_window_ns=200.0, deadtime_ns=0.0, threshold_pe=0.25,
-                 charge_model="spe", spe=_SPE_HK,
+    "hk":   dict(integration_window_ns=200.0, deadtime_ns=0.0, threshold_curve=_SKI_THRESHOLD,
+                 charge_model="spe", spe=_SPE_HK, pe_precision=0.0,
                  time_model="hk_emg", jitter_floor_pe=0.5, tdc_ns=0.4, dark_rate_khz=4.2,
                  provisional=False),
 }
@@ -368,19 +383,49 @@ def _sample_time_jitter(digit_time: np.ndarray, digit_pe: np.ndarray,
     return t
 
 
-def apply_discriminator(pe_reco: np.ndarray, model: dict) -> np.ndarray:
-    """Which digits survive the discriminator, given their **digitised** charge.
+def discriminator_efficiency(pe_reco: np.ndarray, model: dict) -> np.ndarray:
+    """P(fire | digitised charge): WCSim's discriminator S-curve (``threshold_curve``).
+
+    WCSim evaluates it on the raw SPE-table charge, whose mean per photoelectron is
+    the SPE spectrum's ``fit_mean``; LUCiD's charge is normalised to a mean of 1 p.e.
+    (:func:`_sample_spe_charge`), so it is scaled back first. A model with no curve
+    (``basic``) fires on every digit.
+    """
+    pe_reco = np.asarray(pe_reco, dtype=np.float64)
+    curve = model.get("threshold_curve")
+    if curve is None:
+        return np.ones(pe_reco.shape)
+    x = pe_reco * model["spe"]["fit_mean"] + 0.1
+    p = np.polynomial.polynomial.polyval(x, curve)
+    return np.where(x < 1.1, np.clip(p, 0.0, 1.0), 1.0)
+
+
+def apply_discriminator(pe_reco: np.ndarray, model: dict, rng: np.random.Generator) -> np.ndarray:
+    """Which digits survive the discriminator, given their **digitised** charge: each
+    fires with probability :func:`discriminator_efficiency`.
 
     A discriminator fires on the analogue pulse, so this runs after the SPE
     spectrum has been sampled -- see the module docstring for why the ordering
-    is load-bearing and why a single sharp threshold is preferred here over
-    WCSim's SK-specific S-curve.
+    is load-bearing.
     """
-    threshold = float(model.get("threshold_pe", 0.0))
     pe_reco = np.asarray(pe_reco)
-    if threshold <= 0.0:
+    if model.get("threshold_curve") is None:
         return np.ones(pe_reco.shape, dtype=bool)
-    return pe_reco >= threshold
+    return rng.random(pe_reco.shape) < discriminator_efficiency(pe_reco, model)
+
+
+def apply_charge_precision(pe_reco: np.ndarray, model: dict) -> np.ndarray:
+    """Truncate digit charge toward zero to a multiple of ``pe_precision`` p.e., as
+    WCSim's ``AddNewDigit`` does (``src/WCSimWCDigitizer.cc:132``).
+
+    Runs after the discriminator, which decides on the full charge, so a digit
+    below one step is kept with charge 0. ``pe_precision`` 0 leaves charge as is.
+    """
+    pe_reco = np.asarray(pe_reco)
+    step = float(model.get("pe_precision", 0.0))
+    if step <= 0.0:
+        return pe_reco
+    return (step * np.floor(pe_reco.astype(np.float64) / step)).astype(pe_reco.dtype)
 
 
 def apply_readout_resolution(
@@ -558,7 +603,7 @@ def digitize_and_decompose(
     # fluctuates low is lost as it would be in hardware. Surviving digits are
     # renumbered and every deposit's digit_idx remapped, so the decompositions
     # below stay consistent foreign keys into sensor.h5.
-    keep = apply_discriminator(pe_reco, model)
+    keep = apply_discriminator(pe_reco, model, rng)
     digit_sensor = res.digit_sensor_idx
     didx = res.photon_digit_idx
     if not keep.all():
@@ -571,6 +616,7 @@ def digitize_and_decompose(
         digit_sensor = digit_sensor[keep]
         pe_reco = pe_reco[keep]
         t_reco_digit = t_reco_digit[keep]
+    pe_reco = apply_charge_precision(pe_reco, model)
 
     sensor_digits = {
         "sensor_idx": digit_sensor.astype(np.uint16),

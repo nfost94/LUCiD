@@ -22,9 +22,9 @@ The three presets, from `MODEL_PRESETS` in `lucid/simulation/digitizer.py`:
 
 | model | integration window | deadtime | threshold | charge model | time model | dark rate | WCSim provenance |
 |-------|---------------------|----------|-----------|--------------|------------|-----------|-------------------|
-| `basic` | infinite (`None`) | 0 ns | 0 pe | `legacy` (the historical `sk_like` fractional smear) | `none` | 0 kHz | none — idealized passthrough, kept for parity |
-| `ski` | 200 ns | 0 ns | 0.25 pe | `spe` (sampled SK SPE spectrum) | `sk_gauss` | 4.2 kHz | `WCSimWCDigitizer.hh:97-98` (window/deadtime), `WCSimPMTObject.cc` `Getqpe` + HitTimeSmearing `:88-99` (SK charge/time), `:262` (dark rate) |
-| `hk` | 200 ns | 0 ns | 0.25 pe | `spe` (sampled HK SPE spectrum) | `hk_emg` | 4.2 kHz | same digitizer as `ski` (WCSim ships one digitizer, SKI — there is no separate QBEE model); `WCSimPMTObject.cc` HitTimeSmearing `:2124-2138` (HK Box&Line time response, `R12860`), `:2295` (dark rate) |
+| `basic` | infinite (`None`) | 0 ns | none | `legacy` (the historical `sk_like` fractional smear) | `none` | 0 kHz | none — idealized passthrough, kept for parity |
+| `ski` | 200 ns | 0 ns | WCSim S-curve | `spe` (sampled SK SPE spectrum) | `sk_gauss` | 4.2 kHz | `WCSimWCDigitizer.hh:97-98` (window/deadtime), `WCSimPMTObject.cc` `Getqpe` + HitTimeSmearing `:88-99` (SK charge/time), `:262` (dark rate) |
+| `hk` | 200 ns | 0 ns | WCSim S-curve | `spe` (sampled HK SPE spectrum) | `hk_emg` | 4.2 kHz | same digitizer as `ski` (WCSim ships one digitizer, SKI — there is no separate QBEE model); `WCSimPMTObject.cc` HitTimeSmearing `:2124-2138` (HK Box&Line time response, `R12860`), `:2295` (dark rate) |
 
 Both `ski` and `hk` also apply a 0.4 ns TDC truncation after the time-jitter model (WCSim SKI
 timing precision, `WCSimWCDigitizer.hh:99`), and sample charge from a fitted Gaussian+exponential
@@ -33,9 +33,16 @@ resolution function. `ski`'s SPE fit and `hk`'s SPE fit differ (`_SPE_SK` vs `_S
 module) — `hk`'s HitTimeSmearing is also a different functional form (exponentially-modified
 Gaussian vs pure Gaussian for `ski`).
 
+The discriminator is WCSim's `WCSimWCDigitizerSKI::Threshold` S-curve (`WCSimWCDigitizer.hh:102-123`):
+a digit fires with probability P(fire | q) on its digitised charge — 11% at 0.1 p.e., 54% at 0.25,
+82% at 0.5, certain from 1 p.e. — after the SPE spectrum is sampled (`discriminator_efficiency`,
+`apply_discriminator`). Surviving digits' charge is then truncated toward zero to a multiple of
+`pe_precision` p.e. (WCSim `PEPrecision`, `AddNewDigit`), keeping sub-step digits at charge 0;
+every preset has `pe_precision` 0, WCSim's default, and a detector config sets its macro's value.
+
 Algorithm, per sensor (`digitize_event`, mirroring WCSim's SKI integrator): sort hits by time,
-open an integration window at the first hit, sum charge over `[t0, t0+window]`, emit a digit if
-the integrated charge clears `threshold`, veto hits for the following `deadtime`, and repeat from
+open an integration window at the first hit, sum charge over `[t0, t0+window]`, emit a digit
+(the discriminator acts later, on the digitised charge), veto hits for the following `deadtime`, and repeat from
 the next surviving hit. `window=None` makes every group "simple" (fits in one window), which is
 what makes `basic` collapse to one digit per sensor.
 
@@ -50,7 +57,7 @@ backward compatibility with older configs that put digitizer/trigger settings th
 has it, digitizer defaults to `basic` and the trigger is off.
 
 `"digitizer"` may be a bare model name or a dict with a `"model"` key plus overrides — any extra
-key (e.g. `dark_rate_khz`, `threshold_pe`) is merged on top of the preset
+key (e.g. `dark_rate_khz`, `pe_precision`) is merged on top of the preset
 (`resolve_model_config` in `digitizer.py` does `dict(MODEL_PRESETS[name]).update(overrides)`).
 
 The digitizer and trigger are detector properties, so the GeV dataset configs no

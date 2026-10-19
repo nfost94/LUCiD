@@ -34,6 +34,7 @@ from typing import Optional, Union
 import numpy as np
 
 from lucid.simulation.digitizer import (  # noqa: F401  re-exported for tests
+    apply_charge_precision,
     apply_discriminator,
     apply_readout_resolution,
     digitize_event,
@@ -78,8 +79,8 @@ def sample_charges(mu: float, n_pmt: int, n_events: int, model: dict,
         res = digitize_event(flat_sensor, zeros, np.ones_like(zeros),
                              n_sensors=n * n_pmt, model=model)
         q, _ = apply_readout_resolution(res.digit_pe_true, res.digit_time, model, rng)
-        q = np.asarray(q, dtype=np.float64)[apply_discriminator(q, model)]
-        out.append(q)
+        q = np.asarray(q, dtype=np.float64)[apply_discriminator(q, model, rng)]
+        out.append(apply_charge_precision(q, model))
     return np.concatenate(out) if out else np.zeros(0, dtype=np.float64)
 
 

@@ -261,7 +261,7 @@ def check_time(dataset: Path, out: Path, n_shards: int, tol_ns=0.1):
         # jitter that charge gets, and only the digits the discriminator keeps.
         u = rng.uniform(0.0, tdc, n)
         q, t = apply_readout_resolution(np.full(n, float(N)), u, model, rng)
-        return (t - u)[apply_discriminator(q, model)]
+        return (t - u)[apply_discriminator(q, model, rng)]
 
     fig, ax = plt.subplots(2, 3, figsize=(13, 7.6))
     fig.suptitle(f"time residual vs TTS model ({name})", fontweight="bold")

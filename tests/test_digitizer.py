@@ -18,8 +18,8 @@ def _rng():
 def test_resolve_model_config():
     assert resolve_model_config(None)["model"] == "basic"
     assert resolve_model_config("ski")["integration_window_ns"] == 200.0
-    m = resolve_model_config({"model": "hk", "dark_rate_khz": 5.0, "threshold_pe": 0.3})
-    assert m["model"] == "hk" and m["dark_rate_khz"] == 5.0 and m["threshold_pe"] == 0.3
+    m = resolve_model_config({"model": "hk", "dark_rate_khz": 5.0, "pe_precision": 0.3})
+    assert m["model"] == "hk" and m["dark_rate_khz"] == 5.0 and m["pe_precision"] == 0.3
     # untouched preset defaults still present
     assert m["deadtime_ns"] == MODEL_PRESETS["hk"]["deadtime_ns"]
     for bad in ("nope", {"model": "sk9"}):
@@ -80,7 +80,7 @@ def test_windowing_does_not_apply_the_discriminator():
     photoelectron count, where it is inert -- every hit sensor has at least one
     photoelectron.
     """
-    model = resolve_model_config("ski")  # threshold 0.25 pe
+    model = resolve_model_config("ski")  # WCSim discriminator
     sensor = np.array([3, 3])
     times = np.array([500.0, 2000.0])
     charges = np.array([0.1, 1.0])
@@ -88,14 +88,52 @@ def test_windowing_does_not_apply_the_discriminator():
     assert r.n_digits == 2
     np.testing.assert_allclose(sorted(r.digit_pe_true), [0.1, 1.0])
 
-    # The cut lives here instead, on the digitised charge.
+    # The cut lives here instead, on the digitised charge: a 0.1 p.e. pulse
+    # rarely fires, a 2 p.e. pulse always does.
     from lucid.simulation.digitizer import apply_discriminator
-    keep = apply_discriminator(np.array([0.1, 1.0]), model)
-    np.testing.assert_array_equal(keep, [False, True])
+    keep = apply_discriminator(np.repeat([0.1, 2.0], 20_000), model, _rng()).reshape(2, -1)
+    assert keep[0].mean() < 0.2 and keep[1].all()
     # basic has no discriminator, so nothing is ever dropped.
     np.testing.assert_array_equal(
-        apply_discriminator(np.array([0.0, 0.1]), resolve_model_config("basic")),
+        apply_discriminator(np.array([0.0, 0.1]), resolve_model_config("basic"), _rng()),
         [True, True])
+
+
+def test_discriminator_is_wcsims_threshold_curve():
+    """WCSimWCDigitizerSKI::Threshold on the raw SPE-table charge: 11.4% at 0.1 p.e.,
+    53.7% at 0.25, 82.5% at 0.5, certain from 1 p.e. (values of WCSim's polynomial)."""
+    from lucid.simulation.digitizer import apply_discriminator, discriminator_efficiency
+    for name in ("ski", "hk"):
+        model = resolve_model_config(name)
+        raw = np.array([0.1, 0.25, 0.5, 1.0, 3.0])
+        eff = discriminator_efficiency(raw / model["spe"]["fit_mean"], model)
+        np.testing.assert_allclose(eff, [0.114, 0.537, 0.825, 1.0, 1.0], atol=1e-3)
+        # the draw fires at that rate
+        fired = apply_discriminator(np.full(200_000, 0.25 / model["spe"]["fit_mean"]), model, _rng())
+        assert abs(fired.mean() - 0.537) < 0.005
+
+
+def test_charge_precision_truncates_after_the_discriminator():
+    """WCSim's AddNewDigit: charge toward zero in steps of PEPrecision; digits
+    below one step are kept, with charge 0. Step 0 (every preset) leaves charge alone."""
+    from lucid.simulation.digitizer import apply_charge_precision
+    q = np.array([0.1, 0.31, 0.95, 2.0], dtype=np.float32)
+    np.testing.assert_allclose(apply_charge_precision(q, {"pe_precision": 0.3}),
+                               [0.0, 0.3, 0.9, 1.8], atol=1e-6)
+    for name in MODEL_PRESETS:
+        np.testing.assert_array_equal(apply_charge_precision(q, resolve_model_config(name)), q)
+
+    rng = _rng()
+    n = 2000
+    model = resolve_model_config({"model": "hk", "pe_precision": 0.3})
+    sd, _, _ = digitize_and_decompose(
+        sensor_idx=rng.integers(0, 3000, size=n), charge=np.ones(n),
+        t_true=np.zeros(n), t_reco=np.zeros(n),
+        particle_idx=np.zeros(n, np.int64), segment_idx=np.zeros(n, np.int64),
+        emission_process=np.zeros(n, np.int64), n_sensors=3000, model=model, rng=rng)
+    steps = sd["PE"] / 0.3
+    np.testing.assert_allclose(steps, np.round(steps), atol=1e-4)
+    assert (sd["PE"] == 0).any()                     # sub-step digits survive with Q = 0
 
 
 def test_discriminator_drops_digits_and_remaps_digit_idx():
@@ -106,17 +144,19 @@ def test_discriminator_drops_digits_and_remaps_digit_idx():
     """
     rng = _rng()
     n = 400
+    sensor, t_reco = rng.integers(0, 30, size=n), rng.uniform(0, 3000, size=n)
+    model = resolve_model_config("ski")
     sd, hits, seg = digitize_and_decompose(
-        sensor_idx=rng.integers(0, 30, size=n),
+        sensor_idx=sensor,
         charge=np.ones(n), t_true=rng.uniform(0, 3000, size=n),
-        t_reco=rng.uniform(0, 3000, size=n),
+        t_reco=t_reco,
         particle_idx=np.zeros(n, np.int64), segment_idx=np.zeros(n, np.int64),
         emission_process=np.zeros(n, np.int64),
-        n_sensors=30, model=resolve_model_config("ski"), rng=rng)
+        n_sensors=30, model=model, rng=rng)
 
     n_digits = sd["PE"].size
-    # Every surviving digit clears the threshold ...
-    assert (sd["PE"] >= 0.25).all()
+    # The discriminator really dropped some of the windowed digits ...
+    assert n_digits < digitize_event(sensor, t_reco, np.ones(n), 30, model).n_digits
     # ... and every digit_idx still indexes a real digit.
     for tbl in (hits, seg):
         if tbl["digit_idx"].size:
@@ -239,9 +279,10 @@ def test_decompose_basic_single_digit_and_conserves():
 
 def test_decompose_multihit_splits_digit_idx():
     # ski: one particle, one sensor, two bunches >200 ns apart -> two digits,
-    # two hits rows with different digit_idx.
+    # two hits rows with different digit_idx. Both bunches are bright enough
+    # that the discriminator always fires.
     sensor = np.array([4, 4])
-    charge = np.array([2.0, 1.5])
+    charge = np.array([6.0, 5.0])
     t = np.array([1000.0, 3000.0])
     sd, hits, seg = digitize_and_decompose(
         sensor_idx=sensor, charge=charge, t_true=t, t_reco=t,
@@ -251,7 +292,7 @@ def test_decompose_multihit_splits_digit_idx():
     assert sd["sensor_idx"].shape[0] == 2
     assert (hits["sensor_idx"] == 4).all()
     assert sorted(hits["digit_idx"].tolist()) == [0, 1]   # split across digits
-    np.testing.assert_allclose(sorted(hits["PE"]), [1.5, 2.0])
+    np.testing.assert_allclose(sorted(hits["PE"]), [5.0, 6.0])
 
 
 def test_decompose_dark_is_labelled():
