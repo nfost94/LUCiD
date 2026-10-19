@@ -34,10 +34,10 @@ class Cylinder(Detector):
       rather than computed.
     """
 
-    def __init__(self, radius, height, n_sensors, sensor_radius):
+    def __init__(self, radius, height, n_sensors, sensor_radius, expose_height=None):
         """
         Initialize cylindrical detector.
-        
+
         Parameters:
         -----------
         radius : float
@@ -48,8 +48,10 @@ class Cylinder(Detector):
             Number of photosensors
         sensor_radius : float
             Radius of individual sensors
+        expose_height : float or None
+            Height each sensor stands above the wall; None = sensor_radius
         """
-        super().__init__(n_sensors, sensor_radius)
+        super().__init__(n_sensors, sensor_radius, expose_height)
         self.r = radius
         self.H = height
         # Grid params — set via configure_grid() before using propagation methods
@@ -166,7 +168,7 @@ class Cylinder(Detector):
     # ── Construction from a PMT-positions npz file ────────────────────
 
     @classmethod
-    def from_pmt_file(cls, npz_file_path, snap_to_wall=True):
+    def from_pmt_file(cls, npz_file_path, snap_to_wall=True, expose_height=None):
         """Build a :class:`Cylinder` whose PMT positions are read from
         a unified-schema ``.npz`` file (see ``docs/reference/pmt-npz-schema.md``).
 
@@ -182,6 +184,9 @@ class Cylinder(Detector):
             the geometric boundary so the cylinder ray-tracer treats
             them correctly. The pre-snap positions are kept on
             ``self.raw_positions``.
+        expose_height : float or None, optional
+            Height each PMT stands above the wall; None = the npz's
+            ``sensor_radius``, a hemisphere.
 
         Returns
         -------
@@ -225,7 +230,7 @@ class Cylinder(Detector):
         # ── Build the instance, bypassing __init__ (which would do
         # the algorithmic placement) ──
         instance = cls.__new__(cls)
-        Detector.__init__(instance, n, sensor_radius)
+        Detector.__init__(instance, n, sensor_radius, expose_height)
         instance.r = radius
         instance.H = height
         instance._n_cap = None

@@ -27,14 +27,15 @@ def _bounds(points):
     return jnp.ones(points.shape[0], dtype=bool)
 
 
-def _overlap(d):
+def _overlap(d, *_frame):
     """A smooth stand-in for the real overlap kernel; only its d-dependence matters here."""
     return jnp.exp(-(d / R) ** 2)
 
 
 def _deposit(origins, directions, sensor_idx, sensor_positions):
+    axes = jnp.broadcast_to(jnp.array([0.0, 0.0, -1.0]), sensor_positions.shape)
     w = compute_sensor_intersections_base(
-        sensor_idx, sensor_positions, R, origins, directions, _bounds, _overlap)[0]
+        sensor_idx, sensor_positions, axes, R, origins, directions, _bounds, _overlap)[0]
     return jnp.sum(w)
 
 

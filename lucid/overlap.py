@@ -72,6 +72,179 @@ _ST_MIN_SIGMA = 0.02
 # every CI job that needs the image with it.
 _trapezoid = getattr(np, 'trapezoid', None) or np.trapz
 
+# WALL-MOUNTED CAP TABLE LAYOUT (see `precompute_cap_lookup`).
+#
+# The table reaches _CAP_KSIG sigma past the silhouette, where the overlap is Phi(-6) ~ 1e-9, and its
+# offset nodes are sigma / _CAP_NODES_PER_SIGMA apart (trilinear value error ~5e-4 at an edge). The
+# incidence knots are at most _CAP_MAX_DTHETA apart and close enough that the silhouette edge moves
+# by under sigma/4 between knots (r * dtheta <= sigma / 4).
+_CAP_KSIG = 6.0
+_CAP_NODES_PER_SIGMA = 8
+_CAP_MAX_DTHETA = np.deg2rad(2.0)
+# Entries scale as (r / sigma)^3: 3e6 at temperature 0.1, 1.5e8 at 0.02.
+_CAP_MAX_ENTRIES = 1e8
+# Floor on sin(incidence) when splitting the line's offset into (x, v). At normal incidence the
+# silhouette is a disc and the split is arbitrary; the floor keeps it differentiable there and moves
+# x by at most depth * 0.01 (~1 mm for a 20-inch PMT) where the silhouette is not yet round.
+_CAP_SIN_FLOOR = 1e-2
+
+
+def cap_sphere(r: float, h: float) -> Tuple[float, float]:
+    """The sphere whose cap has aperture radius r and height h: (its radius, its centre's depth behind
+    the aperture).
+
+    R = (h^2 + r^2) / (2h) and the centre sits R - h = (r^2 - h^2) / (2h) behind the aperture plane,
+    written so that h == r gives depth exactly 0.0 and R exactly r: the hemisphere, the sphere
+    centred on the wall.
+    """
+    depth = (r * r - h * h) / (2.0 * h)
+    return h + depth, depth
+
+
+def cap_silhouette_rows(r: float, h: float, theta: float, v):
+    """Silhouette of a wall-mounted cap seen along a line at incidence theta to its axis, row by row.
+
+    Coordinates lie in the plane perpendicular to the line, measured from the projection of the
+    sphere centre: x along the projection of the cap axis (towards the apex), v across it. Row v of
+    the silhouette is the interval [lo, hi] in x, empty for |v| > r.
+
+    A line meets the solid cap when it meets the sphere AND the highest point of its chord is in
+    front of the wall. Row v then spans x = rho*cos(phi) for rho*sin(phi + theta) >= depth, where
+    rho = sqrt(R^2 - v^2), which closes to:
+      lo = depth*sin(theta) - e*cos(theta)    the far edge: the rim, an ellipse of semi-axes r, r cos(theta)
+      hi = depth*sin(theta) + e*cos(theta)    the near edge, while the dome still hides behind the rim
+         = rho                                the near edge once the dome's outline shows (depth <= rho*sin(theta))
+    with e = sqrt(r^2 - v^2) the rim's half-chord. At h == r (depth 0) it is half a disc and half an
+    ellipse, area pi r^2 (1 + cos theta) / 2; at theta == 0 the disc of radius r.
+    """
+    _, depth = cap_sphere(r, h)
+    s, c = np.sin(theta), np.cos(theta)
+    e = np.sqrt(np.maximum(r * r - np.asarray(v) ** 2, 0.0))
+    rho = np.sqrt(e * e + depth * depth)
+    lo = depth * s - e * c
+    hi = np.where(depth > rho * s, depth * s + e * c, rho)
+    return lo, hi
+
+
+def precompute_cap_lookup(r: float, h: float, sigma: float):
+    """The cap silhouette convolved with a 2D Gaussian of width sigma, tabulated over the incidence
+    angle and the line's offset (x, v) from the sphere centre's projection (see `cap_silhouette_rows`).
+
+    The Gaussian is separable, so along x the convolution of each row's interval is exact (a
+    difference of normal CDFs) and only the v direction is a quadrature, taken over v = r sin(psi):
+    uniform in psi, which removes the square-root edges of the rows at |v| = r. float64 in NumPy,
+    stored float32.
+
+    Returns (theta, x0, step, table): incidence knots uniform in [0, pi/2]; x nodes x0 + i*step;
+    v nodes j*step; table[k, i, j].
+    """
+    from scipy.special import ndtr
+    sigma = float(sigma)
+    _, depth = cap_sphere(r, h)
+    step = sigma / _CAP_NODES_PER_SIGMA
+    pad = _CAP_KSIG * sigma
+    # Every silhouette lies in x in [-r, r + depth] and |v| <= r (the cap sits inside the ball of
+    # radius r about its aperture centre, which projects `depth*sin(theta)` from the sphere centre).
+    x = np.arange(-r - pad, r + depth + pad + step, step)
+    v = np.arange(0.0, r + pad + step, step)
+    n_theta = int(np.ceil((np.pi / 2) / min(_CAP_MAX_DTHETA, sigma / (4.0 * r)))) + 1
+    if n_theta * x.size * v.size > _CAP_MAX_ENTRIES:
+        raise ValueError(
+            f"cap overlap table for sigma = {sigma / r:.3g} r would hold "
+            f"{n_theta * x.size * v.size:.2e} entries; entries grow as (r / sigma)^3")
+    theta = np.linspace(0.0, np.pi / 2, n_theta)
+
+    psi = np.linspace(-np.pi / 2, np.pi / 2, int(np.ceil(np.pi * r / (step / 2))) + 1)
+    w_psi = np.full(psi.size, psi[1] - psi[0])
+    w_psi[[0, -1]] *= 0.5
+    v_row = r * np.sin(psi)
+    # Gaussian weight of each row v' = r sin(psi) at each v node, with dv' = r cos(psi) dpsi.
+    g = (np.exp(-(v[:, None] - v_row[None, :]) ** 2 / (2.0 * sigma ** 2))
+         / (np.sqrt(2.0 * np.pi) * sigma) * (r * np.cos(psi) * w_psi)[None, :])
+
+    table = np.empty((n_theta, x.size, v.size), dtype=np.float32)
+    for k, th in enumerate(theta):
+        lo, hi = cap_silhouette_rows(r, h, th, v_row)
+        row = ndtr((hi[None, :] - x[:, None]) / sigma) - ndtr((lo[None, :] - x[:, None]) / sigma)
+        table[k] = row @ g.T
+    return theta, float(x[0]), step, table
+
+
+def _cap_cache_filename(r: float, h: float, sigma: float) -> str:
+    # Layout constants are part of the table's identity, as in `get_cache_filename`.
+    return (f"cap_overlap_r{r:.6f}_h{h:.6f}_sigma{sigma:.6f}"
+            f"_ksig{_CAP_KSIG:g}_n{_CAP_NODES_PER_SIGMA}_dth{np.rad2deg(_CAP_MAX_DTHETA):g}.npz")
+
+
+def _load_cap_lookup(r: float, h: float, sigma: float):
+    name = _cap_cache_filename(r, h, sigma)
+    filename = next((c for c in (os.path.join(d, name) for d in _cache_dirs())
+                     if os.path.exists(c)), None)
+    if filename is None:
+        return None
+    try:
+        with np.load(filename) as f:
+            return f['theta'], float(f['x0']), float(f['step']), f['table']
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _save_cap_lookup(r: float, h: float, sigma: float, theta, x0, step, table) -> None:
+    # Same contract as `save_overlap_values`: written whole and moved into place, never fatal.
+    cache_dir = _writable_cache_dir()
+    if cache_dir is None:
+        return
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile('wb', dir=cache_dir, suffix='.tmp', delete=False) as f:
+            tmp = f.name
+            np.savez(f, theta=theta, x0=x0, step=step, table=table)
+        os.replace(tmp, os.path.join(cache_dir, _cap_cache_filename(r, h, sigma)))
+    except OSError:
+        if tmp is not None and os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _cap_lookup_fn(theta, x0, step, table):
+    """Trilinear lookup of a `precompute_cap_lookup` table at a line's geometry.
+
+    Takes `to_sensor` (the line's closest-approach offset from the sphere centre, perpendicular to
+    the line), the unit line direction and the cap's unit axis, each (N, 3). Lines are unsigned:
+    the silhouette is the same seen from either end.
+    """
+    cos_knots = jnp.asarray(np.cos(theta), dtype=jnp.float32)
+    dtheta = float(theta[1] - theta[0])
+    tab = jnp.asarray(table)
+    n_c, n_x, n_v = table.shape
+    v2_knots = jnp.asarray((np.arange(n_v) * step) ** 2, dtype=jnp.float32)
+    sg = jax.lax.stop_gradient
+
+    def lookup(to_sensor, line_dir, axis):
+        cos_inc = jnp.minimum(jnp.abs(jnp.sum(line_dir * axis, axis=-1)), 1.0)
+        sin_inc = jnp.sqrt(1.0 - cos_inc ** 2 + _CAP_SIN_FLOOR ** 2)
+        # to_sensor is perpendicular to the line, so its component along the projected axis is
+        # (to_sensor . axis) / sin(incidence); v^2 is the rest of |to_sensor|^2.
+        x = jnp.sum(to_sensor * axis, axis=-1) / sin_inc
+        v2 = jnp.maximum(jnp.sum(to_sensor ** 2, axis=-1) - x ** 2, 0.0)
+
+        # Indices are hard (stop_gradient); only the interpolation weights carry the gradient.
+        # Incidence: knots uniform in angle, interpolated linearly in cos.
+        k = jnp.clip(jnp.floor(jnp.arccos(sg(cos_inc)) / dtheta), 0, n_c - 2).astype(jnp.int32)
+        wc = jnp.clip((cos_knots[k] - cos_inc) / (cos_knots[k] - cos_knots[k + 1]), 0.0, 1.0)
+        fx = (x - x0) / step
+        i = jnp.clip(jnp.floor(sg(fx)), 0, n_x - 2).astype(jnp.int32)
+        wx = jnp.clip(fx - i, 0.0, 1.0)
+        # v: interpolated in v^2, so the lookup is even and smooth through v = 0.
+        j = jnp.clip(jnp.floor(jnp.sqrt(sg(v2)) / step), 0, n_v - 2).astype(jnp.int32)
+        wv = jnp.clip((v2 - v2_knots[j]) / (v2_knots[j + 1] - v2_knots[j]), 0.0, 1.0)
+
+        def plane(kk):
+            return ((1 - wx) * ((1 - wv) * tab[kk, i, j] + wv * tab[kk, i, j + 1])
+                    + wx * ((1 - wv) * tab[kk, i + 1, j] + wv * tab[kk, i + 1, j + 1]))
+        return (1 - wc) * plane(k) + wc * plane(k + 1)
+
+    return lookup
+
 
 def gaussian_kernel(rho: float, theta: float, d: float, r: float, sigma: float) -> float:
     """2D Gaussian distribution centered at the origin with std sigma.
@@ -424,6 +597,7 @@ def precompute_lookup(r: float,
 
 def create_overlap_prob(sigma: Optional[float],
                         r: float,
+                        h: Optional[float] = None,
                         n_theta: int = _N_QUAD,
                         n_rho: int = _N_QUAD,
                         num_dense: int = _NUM_DENSE,
@@ -440,7 +614,16 @@ def create_overlap_prob(sigma: Optional[float],
     sigma : Optional[float]
         Width parameter (if None or < 0.02*r, uses step function)
     r : float
-        Radius (must be >0)
+        Radius (must be >0); for a wall-mounted cap, its aperture radius
+    h : Optional[float], optional
+        None (default): a free-standing sphere of radius r (string DOMs), whose silhouette is a disc
+        of radius r from every direction; the returned function takes the line-to-centre distance d.
+        A float: a cap of height h (0 < h <= r) standing on the wall over an aperture of radius r,
+        the cap of a sphere of radius R = (h^2 + r^2) / (2h) (see `cap_sphere`). Its silhouette
+        depends on the incidence angle, and the returned function takes
+        (d, to_sensor, line_dir, axis): d against R for the hard step; for the soft overlap, the
+        line's offset from the sphere centre, its direction and the cap axis (see `_cap_lookup_fn`).
+        h == r is the hemisphere; its hard step is the free sphere's.
     n_theta : int, optional
         Number of points for angular integration, by default 2000
     n_rho : int, optional
@@ -478,6 +661,10 @@ def create_overlap_prob(sigma: Optional[float],
     """
     if r <= 0:
         raise ValueError("r must be positive.")
+    if h is not None and not 0.0 < h <= r:
+        raise ValueError(f"cap height h must satisfy 0 < h <= r, got h={h}, r={r}")
+    # The hard step's sphere: the free sphere itself, or the sphere a cap is cut from (R == r at h == r).
+    r_step = r if h is None else cap_sphere(r, h)[0]
 
     # Use step function if sigma is None or very small.
     # STRAIGHT-THROUGH: the forward value is the hard step (occupancy/forward unchanged), but
@@ -492,16 +679,18 @@ def create_overlap_prob(sigma: Optional[float],
         # gradient; the track/position gradient then flows ONLY through DiCE score + smooth physics.
         st_frac = st_width_frac
 
+        # `*_frame` takes the cap geometry a wall-mounted caller passes; the step reads d alone. With
+        # the leg bound on, d < R over the travelled leg is exactly the cap: that leg ends at the wall.
         if st_frac <= 0.0:
-            def overlap_prob(d: float) -> float:
-                return jnp.where(d < r, 1.0, 0.0)            # hard, grad 0 a.e. (no surrogate)
+            def overlap_prob(d: float, *_frame) -> float:
+                return jnp.where(d < r_step, 1.0, 0.0)       # hard, grad 0 a.e. (no surrogate)
             return overlap_prob
 
         st_width = st_frac * r
 
-        def overlap_prob(d: float) -> float:
-            hard = jnp.where(d < r, 1.0, 0.0)
-            soft = jax.nn.sigmoid((r - d) / st_width)
+        def overlap_prob(d: float, *_frame) -> float:
+            hard = jnp.where(d < r_step, 1.0, 0.0)
+            soft = jax.nn.sigmoid((r_step - d) / st_width)
             return jax.lax.stop_gradient(hard - soft) + soft   # fwd = hard; grad = d(soft)/dd
 
         return overlap_prob
@@ -514,6 +703,24 @@ def create_overlap_prob(sigma: Optional[float],
     # (and hence the energy) without changing the gradient DIRECTION (it is a pure scale). Calibrate C once
     # per detector (ratio of temp=None to temp=0.1 total charge). See MISMATCH_PLAN.md.
     _RENORM = renorm
+
+    if h is not None:
+        # The silhouette depends on incidence, so the table is 3D (`precompute_cap_lookup`), and the
+        # Gaussian smears it in the plane perpendicular to the line, as the free sphere's does. The
+        # silhouette lies in front of the wall, so a line can only meet it on the leg it travels: the
+        # soft weight needs no leg bound.
+        if mode != 'interp':
+            raise ValueError(f"overlap mode {mode!r} is not implemented for a wall-mounted cap")
+        cached = _load_cap_lookup(r, h, sigma) if use_cache else None
+        if cached is None:
+            cached = precompute_cap_lookup(r, h, sigma)
+            if use_cache:
+                _save_cap_lookup(r, h, sigma, *cached)
+        cap_lookup = _cap_lookup_fn(*cached)
+
+        def overlap_prob(d, to_sensor, line_dir, axis):
+            return _RENORM * cap_lookup(to_sensor, line_dir, axis)
+        return overlap_prob
 
     # mode == 'cubic' falls through: load the EXACT lookup below, then interpolate it with a
     # natural cubic spline (C2) instead of jnp.interp (C0) -- value-exact at the knots AND correct

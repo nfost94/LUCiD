@@ -106,6 +106,7 @@ class DetectorGeometry(NamedTuple):
                 overlap_renorm=overlap_renorm,
                 overlap_mode=overlap_mode,
                 deposit_leg_bound=deposit_leg_bound,
+                expose_height=detector.expose_height,
                 **grid_params)
 
         return DetectorGeometry(

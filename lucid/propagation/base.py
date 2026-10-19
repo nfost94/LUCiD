@@ -155,7 +155,7 @@ def calculate_hit_properties(ray_origins, ray_directions, t_geometry, inside_sen
     return hit_positions, final_normals
 
 
-def compute_sensor_intersections_base(sensor_idx, sensor_positions, sensor_radius,
+def compute_sensor_intersections_base(sensor_idx, sensor_positions, sensor_axes, sensor_radius,
                                         ray_origins, ray_directions, geometry_bounds_check,
                                         overlap_prob, t_geometry=None):
     """
@@ -166,9 +166,12 @@ def compute_sensor_intersections_base(sensor_idx, sensor_positions, sensor_radiu
     sensor_idx : ndarray
         Indices of potential sensors
     sensor_positions : ndarray
-        Positions of all sensors
+        Centres of the sensor spheres. A sensor is the part of its sphere in front of the wall (a
+        cap; see shared.create_propagator), so the centre sits behind the wall unless h == r.
+    sensor_axes : ndarray
+        Inward unit axis of each sensor, the wall normal at its aperture
     sensor_radius : float
-        Radius of each sensor
+        Radius of each sensor sphere
     ray_origins : ndarray
         Starting points of rays
     ray_directions : ndarray
@@ -176,7 +179,8 @@ def compute_sensor_intersections_base(sensor_idx, sensor_positions, sensor_radiu
     geometry_bounds_check : callable
         Function that checks if a point is within the geometry bounds
     overlap_prob : callable
-        Function that calculates overlap probability
+        Overlap probability, called as overlap_prob(d_eff, to_sensor, ray_d, axes): see
+        `create_overlap_prob` with a cap height h
         
     t_geometry : array (N,) or None
         Distance along each (unit) ray to where it leaves the detector. None, the default, leaves
@@ -297,7 +301,11 @@ def compute_sensor_intersections_base(sensor_idx, sensor_positions, sensor_radiu
         _past = jnp.maximum(t_closest[:, 0] - t_geometry, 0.0)
         d_eff = jnp.sqrt(distance ** 2 + _past ** 2 + 1e-12)
 
-    weights = jnp.where(valid & _ahead, overlap_prob(d_eff), 0.0)
+    # The hard step reads d_eff against the sphere radius. The soft overlap reads the cap silhouette
+    # at this line's offset from the sphere centre (`to_sensor`) and its incidence on the sensor
+    # axis; that silhouette lies in front of the wall, so the soft weight needs no leg bound.
+    axes = sensor_axes[sensor_idx]
+    weights = jnp.where(valid & _ahead, overlap_prob(d_eff, to_sensor, ray_d, axes), 0.0)
     # Check if point is inside sensor (keep as boolean)
     # Not gated by `_ahead`: the geometry flag uses the same distance `d_eff` as the weight above (so
     # with the leg bound on, charge and geometry agree), but not the same gate. A behind candidate

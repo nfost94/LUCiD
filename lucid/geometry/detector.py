@@ -113,10 +113,14 @@ def generate_detector(file_path):
         ``radius / height / n_sensors / sensor_radius``.
 
     The npz path is resolved relative to the config-file directory.
+
+    An optional ``expose_height`` in ``geometry_definitions`` is the height each
+    sensor stands above the wall (default: its radius, a hemisphere).
     """
     config = load_detector_config(file_path)
     detector_type = config['detector_type']
     geom_def = config['geometry_definitions']
+    expose_height = geom_def.get('expose_height')
 
     cls = get_detector_class(detector_type)
 
@@ -124,14 +128,15 @@ def generate_detector(file_path):
         if 'npz_file_path' in geom_def:
             config_dir = os.path.dirname(os.path.abspath(file_path))
             npz_path = os.path.join(config_dir, geom_def['npz_file_path'])
-            return cls.from_pmt_file(npz_path)
+            return cls.from_pmt_file(npz_path, expose_height=expose_height)
         return cls(geom_def['radius'], geom_def['height'],
-                   geom_def['n_sensors'], geom_def['sensor_radius'])
+                   geom_def['n_sensors'], geom_def['sensor_radius'], expose_height)
     elif cls is Sphere:
-        return cls(geom_def['radius'], geom_def['n_sensors'], geom_def['sensor_radius'])
+        return cls(geom_def['radius'], geom_def['n_sensors'], geom_def['sensor_radius'],
+                   expose_height)
     elif cls is Box:
         return cls(geom_def['length'], geom_def['width'], geom_def['height'],
-                   geom_def['n_sensors'], geom_def['sensor_radius'])
+                   geom_def['n_sensors'], geom_def['sensor_radius'], expose_height)
     elif cls is StringTelescope:
         # Telescope geometry: per-DOM positions live in an NPZ next to the config.
         return cls.from_config(file_path)

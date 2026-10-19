@@ -27,7 +27,7 @@ def _bounds(points):
     return jnp.ones(points.shape[0], dtype=bool)
 
 
-def _overlap(d):
+def _overlap(d, *_frame):
     return jnp.exp(-(d / R_SENSOR) ** 2)
 
 
@@ -64,9 +64,11 @@ def _rays(seed=0):
 
 def _intersect(origins, directions, centers):
     idx = jnp.arange(origins.shape[0])
+    axes = -centers * np.array([1.0, 1.0, 0.0])                # barrel PMTs face the axis
+    axes = axes / np.linalg.norm(axes, axis=1, keepdims=True)
     _, times, _, normals, hit, points = compute_sensor_intersections_base(
-        idx, jnp.asarray(centers), R_SENSOR, jnp.asarray(origins), jnp.asarray(directions),
-        _bounds, _overlap)
+        idx, jnp.asarray(centers), jnp.asarray(axes, jnp.float32), R_SENSOR,
+        jnp.asarray(origins), jnp.asarray(directions), _bounds, _overlap)
     return np.asarray(times)[:, 0], np.asarray(normals), np.asarray(hit), np.asarray(points)
 
 

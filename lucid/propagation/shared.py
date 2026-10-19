@@ -19,7 +19,7 @@ from lucid.propagation.base import (
     process_intersection_normals,
     find_closest_sensors,
 )
-from lucid.overlap import create_overlap_prob
+from lucid.overlap import create_overlap_prob, cap_sphere
 
 
 def first_hit_survival(weights, times):
@@ -157,7 +157,7 @@ def create_propagator(detector, sensor_positions, sensor_radius,
                       temperature=0.2, max_candidates_per_ray=4,
                       overlap_st_width_frac=0.35, overlap_renorm=1.0,
                       overlap_mode='interp', deposit_leg_bound=False,
-                      **grid_params):
+                      expose_height=None, **grid_params):
     """Build a JIT-compiled photon propagator using detector methods.
 
     Parameters
@@ -165,7 +165,13 @@ def create_propagator(detector, sensor_positions, sensor_radius,
     detector : Detector
         Detector instance with Phase 9 methods implemented.
     sensor_positions : jnp.ndarray, shape (n_sensors, 3)
+        Centres of the sensor apertures, on the wall.
     sensor_radius : float
+        Aperture radius r.
+    expose_height : float or None
+        Height h the sensor stands above the wall. Each sensor is the cap of a sphere: aperture
+        radius r, height h, so a sphere of radius (h^2 + r^2) / (2h) centred (r^2 - h^2) / (2h) behind
+        the aperture. Default None = r, the hemisphere centred on the wall.
     temperature : float
         Soft-assignment temperature for overlap probability.
     overlap_st_width_frac : float
@@ -225,16 +231,30 @@ def create_propagator(detector, sensor_positions, sensor_radius,
     validate_sensor_map(assignments_geometric, inverted_sensor_map,
                         num_sensors, detector, max_candidates_per_ray)
 
+    # 4c. Sensor shape: the cap of a sphere standing on the wall (see `expose_height`). Each
+    # sensor's axis is the inward wall normal where it sits: a ray from the detector centre leaves
+    # the (convex) detector once, at the sensor, so intersect_ray and compute_normal give that normal
+    # for any geometry. At h == r the depth is exactly 0.0 and the centres are the positions as given.
+    expose_height = sensor_radius if expose_height is None else expose_height
+    sphere_radius, centre_depth = cap_sphere(sensor_radius, expose_height)
+    centre = jnp.broadcast_to(jnp.asarray(detector.C, dtype=sensor_positions.dtype),
+                              sensor_positions.shape)
+    outward = sensor_positions - centre
+    outward = outward / jnp.linalg.norm(outward, axis=1, keepdims=True)
+    wall_points, _, _, wall_surface = detector.intersect_ray(centre, outward)
+    sensor_axes = -detector.compute_normal(wall_points, wall_surface)
+    sphere_centres = sensor_positions - centre_depth * sensor_axes
+
     # 5. Overlap probability (shared)
     # temperature=None → step function (hard assignment, non-differentiable)
     # temperature=float → Gaussian kernel with sigma = temperature * sensor_radius
     if temperature is None:
         overlap_prob = create_overlap_prob(
-            None, sensor_radius,
+            None, sensor_radius, expose_height,
             st_width_frac=overlap_st_width_frac, renorm=overlap_renorm, mode=overlap_mode)
     else:
         overlap_prob = create_overlap_prob(
-            temperature * sensor_radius, sensor_radius,
+            temperature * sensor_radius, sensor_radius, expose_height,
             st_width_frac=overlap_st_width_frac, renorm=overlap_renorm, mode=overlap_mode)
 
     # 6. Bounds check closure
@@ -274,7 +294,7 @@ def create_propagator(detector, sensor_positions, sensor_radius,
         # d. Compute sensor intersections (shared, vmapped over sensor slots)
         def compute_for_slot(slot_sensors):
             return compute_sensor_intersections_base(
-                slot_sensors, sensor_positions, sensor_radius,
+                slot_sensors, sphere_centres, sensor_axes, sphere_radius,
                 photon_origins, photon_directions,
                 bounds_check, overlap_prob,
                 # None when off drops the leg-bound code from the trace; see `deposit_leg_bound`.
