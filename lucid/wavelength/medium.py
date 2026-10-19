@@ -139,6 +139,25 @@ def _scintillation_kwargs_from(data: dict) -> dict:
     }
 
 
+_HC_EV_NM = 1239.84198  # h c in eV nm
+
+
+def _tabulated_coeff(section: dict, wl: jnp.ndarray) -> jnp.ndarray:
+    """1 / length on ``wl`` from a section's ``wavelengths_nm`` / ``length_m`` table.
+
+    The length is interpolated linearly in photon energy and held at the end values outside
+    the table, as Geant4 evaluates a material property, so a table taken from a Geant4 material
+    (WCSim's water) reproduces it.
+    """
+    e_tab = _HC_EV_NM / np.asarray(section["wavelengths_nm"], dtype=np.float64)
+    order = np.argsort(e_tab)
+    length = jnp.interp(_HC_EV_NM / wl,
+                        jnp.asarray(e_tab[order], dtype=jnp.float32),
+                        jnp.asarray(np.asarray(section["length_m"], dtype=np.float64)[order],
+                                    dtype=jnp.float32))
+    return 1.0 / length
+
+
 def make_medium(material: str = "water",
                 wavelength_grid: Optional[jnp.ndarray] = None,
                 medium_model_path: str = None) -> MediumProperties:
@@ -187,35 +206,47 @@ def make_medium(material: str = "water",
 
     wl = jnp.asarray(wavelength_grid, dtype=jnp.float32)
 
+    # Each of the three coefficients is either tabulated (``wavelengths_nm`` / ``length_m``,
+    # see `_tabulated_coeff`) or given by the SK calibration paper's parametrisation.
+
     # Symmetric (Rayleigh) scattering coefficient
     sc = data["scattering"]["symmetric"]
-    P4, P5 = sc["P4"], sc["P5"]
-    alpha_sym = P4 / (wl ** 4) * (1.0 + P5 / (wl ** 2))
+    if "length_m" in sc:
+        alpha_sym = _tabulated_coeff(sc, wl)
+    else:
+        P4, P5 = sc["P4"], sc["P5"]
+        alpha_sym = P4 / (wl ** 4) * (1.0 + P5 / (wl ** 2))
 
     # Asymmetric (Mie) scattering coefficient
     ac = data["scattering"]["asymmetric"]
-    P6, P7, P8 = ac["P6"], ac["P7"], ac["P8"]
-    alpha_asym = P6 * (1.0 + P7 / (wl ** 4) * (wl - P8) ** 2)
+    if "length_m" in ac:
+        alpha_asym = _tabulated_coeff(ac, wl)
+    else:
+        P6, P7, P8 = ac["P6"], ac["P7"], ac["P8"]
+        alpha_asym = P6 * (1.0 + P7 / (wl ** 4) * (wl - P8) ** 2)
     g = ac["default_asymmetry_g"]
 
     # Absorption coefficient
     ab = data["absorption"]
-    P0, P1, P2, P3 = ab["P0"], ab["P1"], ab["P2"], ab["P3"]
-    pf_wl = jnp.array(ab["pope_fry_wavelengths_nm"], dtype=jnp.float32)
-    pf_abs = jnp.array(ab["pope_fry_absorption_m_inv"], dtype=jnp.float32)
+    if "length_m" in ab:
+        alpha_abs = _tabulated_coeff(ab, wl)
+    else:
+        P0, P1, P2, P3 = ab["P0"], ab["P1"], ab["P2"], ab["P3"]
+        pf_wl = jnp.array(ab["pope_fry_wavelengths_nm"], dtype=jnp.float32)
+        pf_abs = jnp.array(ab["pope_fry_absorption_m_inv"], dtype=jnp.float32)
 
-    # Eq.(15) power-law fit (blue) spliced onto the Pope&Fry data (red) at 464 nm.
-    # The two pieces differ by ~12% at the seam, so a hard switch leaves a kink; blend
-    # them with a C2 smootherstep over a +-12 nm window. (The blend WEIGHT is C2; the
-    # result inherits the piecewise-linear knot kinks of the interpolated Pope&Fry
-    # table itself — tiny, but not strictly C2.)
-    C_powerlaw = P0 * P2 * (wl / 500.0) ** P3
-    C_popefry = jnp.interp(wl, pf_wl, pf_abs)
-    _bw = 12.0
-    _t = jnp.clip((wl - (464.0 - _bw)) / (2.0 * _bw), 0.0, 1.0)
-    _s = _t * _t * _t * (_t * (_t * 6.0 - 15.0) + 10.0)   # smootherstep (C2)
-    C = (1.0 - _s) * C_powerlaw + _s * C_popefry
-    alpha_abs = P0 * P1 / (wl ** 4) + C
+        # Eq.(15) power-law fit (blue) spliced onto the Pope&Fry data (red) at 464 nm.
+        # The two pieces differ by ~12% at the seam, so a hard switch leaves a kink; blend
+        # them with a C2 smootherstep over a +-12 nm window. (The blend WEIGHT is C2; the
+        # result inherits the piecewise-linear knot kinks of the interpolated Pope&Fry
+        # table itself — tiny, but not strictly C2.)
+        C_powerlaw = P0 * P2 * (wl / 500.0) ** P3
+        C_popefry = jnp.interp(wl, pf_wl, pf_abs)
+        _bw = 12.0
+        _t = jnp.clip((wl - (464.0 - _bw)) / (2.0 * _bw), 0.0, 1.0)
+        _s = _t * _t * _t * (_t * (_t * 6.0 - 15.0) + 10.0)   # smootherstep (C2)
+        C = (1.0 - _s) * C_powerlaw + _s * C_popefry
+        alpha_abs = P0 * P1 / (wl ** 4) + C
 
     # Refractive index: the tabulated n(lambda) when the material has one, and its group index
     # n_g = n - lambda dn/dlambda (Geant4's GROUPVEL from RINDEX) for the photon speed c / n_g;
