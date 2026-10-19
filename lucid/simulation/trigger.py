@@ -15,6 +15,11 @@ threshold sits well above the dark floor (μ = rate·n_sensors·W): for 4.2 kHz 
 windows/s the operating point is ~μ+7σ (n_thr≈30) to keep the accidental rate
 below ~0.1 Hz — not the naive 3σ.
 
+:class:`HKTrigger` is the alternative for HK: WCSim's NDigits trigger as the HK
+production runs it (fixed readout gates around a trigger time; see its docstring).
+A physics-config ``"trigger"`` block with ``"model": "hk"`` selects it
+(:func:`trigger_from_block`).
+
 Pure NumPy; operates on the per-event digit time list, host-side.
 """
 from __future__ import annotations
@@ -38,6 +43,11 @@ class TriggerConfig:
     n_thr: int = 30
     pad_before_ns: float = 30.0
     pad_after_ns: float = 30.0
+
+    name = "sliding_window"
+
+    def find_gates(self, times: np.ndarray) -> np.ndarray:
+        return find_trigger_gates(times, self)
 
     @classmethod
     def from_block(cls, block):
@@ -98,6 +108,96 @@ def find_trigger_gates(times: np.ndarray, cfg: TriggerConfig) -> np.ndarray:
     return np.asarray(merged)
 
 
+# WCSimWCTriggerBase::AlgNDigits steps its search window, and rounds the trigger time down, by this.
+_WCSIM_STEP_NS = 5.0
+
+
+@dataclass
+class HKTrigger:
+    """HK trigger: WCSim's NDigits trigger (``WCSimWCTriggerBase::AlgNDigits``,
+    ``src/WCSimWCTrigger.cc:240-367``) with the HK production's settings as defaults
+    (``run_macros/particle_iso_e.mac``: ``/DAQ/TriggerNDigits/Threshold 25``,
+    ``AdjustForNoise true``, ``Window 200 ns``, ``PreTriggerWindow -400 ns``,
+    ``PostTriggerWindow +950 ns``).
+
+    * It fires when a ``window_ns`` window first holds more than the threshold's
+      digits, the threshold raised for dark noise by round(rate x window x PMTs)
+      (``AdjustNDigitsThresholdForNoise``, ``:155-174``). WCSim uses the
+      ``/DarkRate/SetDarkRate`` value there, before the dark-rate conversion factor
+      the digitizer's ``dark_rate_khz`` includes: 25 + round(4.2 kHz x 200 ns x
+      19746) = 42 for HK.
+    * The trigger time is the time of the digit that makes it fire, rounded down to
+      WCSim's 5 ns search step, and the gate read out is
+      ``[t_trig - pad_before_ns, t_trig + pad_after_ns]``, started no earlier than
+      the previous gate's end so no digit is read twice (``FillDigitsCollection``).
+    * The search resumes at the gate's end counting only later digits, so late light
+      (a Michel electron) makes a trigger of its own.
+
+    ``n_thr`` (digits in a window that fire) is the adjusted threshold + 1, so the
+    attributes the pipeline records read as they do for :class:`TriggerConfig`.
+    """
+    threshold: int = 25
+    window_ns: float = 200.0
+    pad_before_ns: float = 400.0
+    pad_after_ns: float = 950.0
+    noise_dark_rate_khz: float = 4.2     # 0: no adjustment for noise
+    n_pmts: int = 19746                  # HK ID 20" PMTs (geofile Type 1)
+
+    name = "hk"
+
+    @property
+    def adjusted_threshold(self) -> int:
+        mean_dark = self.noise_dark_rate_khz * 1e3 * self.window_ns * 1e-9 * self.n_pmts
+        return self.threshold + int(np.floor(mean_dark + 0.5))     # C++ round()
+
+    @property
+    def n_thr(self) -> int:
+        return self.adjusted_threshold + 1
+
+    def find_gates(self, times: np.ndarray) -> np.ndarray:
+        return find_hk_trigger_gates(times, self)
+
+    @classmethod
+    def from_block(cls, block):
+        allowed = {"threshold", "window_ns", "pad_before_ns", "pad_after_ns",
+                   "noise_dark_rate_khz", "n_pmts"}
+        return cls(**{k: v for k, v in dict(block).items() if k in allowed})
+
+
+def find_hk_trigger_gates(times: np.ndarray, cfg: HKTrigger) -> np.ndarray:
+    """Return the :class:`HKTrigger` gates ``[[t_start, t_end], ...]`` for one event.
+
+    The first digit to complete ``n_thr`` digits within ``window_ns`` (the
+    ``n_thr``-th of them) is the one WCSim's stepped search fires on: its trigger
+    time is the ``n_thr``-th digit at or after the first window start that holds
+    ``n_thr`` digits. Returns an empty ``(0, 2)`` array when nothing triggers.
+    """
+    t = np.sort(np.asarray(times, dtype=np.float64))
+    n = cfg.n_thr
+    gates = []
+    start = 0                       # first digit the search counts
+    prev_end = -np.inf
+    while t.size - start >= n:
+        tt = t[start:]
+        fires = np.flatnonzero(tt[n - 1:] - tt[:tt.size - n + 1] <= cfg.window_ns)
+        if fires.size == 0:
+            break
+        t_trig = np.floor(tt[fires[0] + n - 1] / _WCSIM_STEP_NS) * _WCSIM_STEP_NS
+        end = t_trig + cfg.pad_after_ns
+        gates.append([max(t_trig - cfg.pad_before_ns, prev_end), end])
+        prev_end = end
+        start += int(np.searchsorted(tt, end, side="left"))
+    return np.asarray(gates, dtype=np.float64).reshape(-1, 2)
+
+
+def trigger_from_block(block):
+    """The trigger a physics-config ``"trigger"`` block describes: :class:`HKTrigger` for
+    ``"model": "hk"``, otherwise :class:`TriggerConfig`; ``None`` disables the trigger."""
+    if block is not None and dict(block).get("model") == "hk":
+        return HKTrigger.from_block(block)
+    return TriggerConfig.from_block(block)
+
+
 def assign_windows(times: np.ndarray, gates: np.ndarray) -> np.ndarray:
     """Per-hit trigger-window index (``0..n_gates-1``); ``-1`` if out of every gate.
 
@@ -120,8 +220,7 @@ def hits_in_gates(times: np.ndarray, gates: np.ndarray) -> np.ndarray:
     return assign_windows(times, gates) >= 0
 
 
-def apply_trigger(sensor_digits: dict, hits_sparse: dict, seg_hits: dict,
-                  cfg: TriggerConfig):
+def apply_trigger(sensor_digits: dict, hits_sparse: dict, seg_hits: dict, cfg):
     """Apply the readout trigger to one event's digitizer output.
 
     Keeps only in-gate digits, **canonically re-sorts** them by
@@ -136,7 +235,7 @@ def apply_trigger(sensor_digits: dict, hits_sparse: dict, seg_hits: dict,
     """
     T = np.asarray(sensor_digits["T"], dtype=np.float64)
     n_dig = T.shape[0]
-    gates = find_trigger_gates(T, cfg)
+    gates = cfg.find_gates(T)                          # TriggerConfig or HKTrigger
     if gates.shape[0] == 0:
         return None
     win = assign_windows(T, gates)                    # per-digit window, -1 if out

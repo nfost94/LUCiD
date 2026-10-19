@@ -3,6 +3,7 @@ import numpy as np
 
 from lucid.simulation.trigger import (
     TriggerConfig, find_trigger_gates, assign_windows, hits_in_gates, apply_trigger,
+    HKTrigger, find_hk_trigger_gates, trigger_from_block,
 )
 
 
@@ -103,6 +104,68 @@ def test_empty():
     cfg = TriggerConfig()
     assert find_trigger_gates(np.array([]), cfg).shape == (0, 2)
     assert assign_windows(np.array([]), np.empty((0, 2))).shape == (0,)
+
+
+# --- HK trigger (WCSim NDigits as the HK production runs it) -------------------
+
+def test_hk_threshold_is_wcsims_noise_adjusted_threshold():
+    """25 + round(4.2 kHz x 200 ns x 19746 PMTs) = 25 + 17 = 42; fires on more than 42."""
+    cfg = HKTrigger()
+    assert cfg.adjusted_threshold == 42 and cfg.n_thr == 43
+    assert HKTrigger(noise_dark_rate_khz=0.0).n_thr == 26
+
+
+def test_hk_gate_is_fixed_around_the_trigger_time():
+    """Trigger time = the 43rd digit within 200 ns, rounded down to 5 ns; gate [t - 400, t + 950]."""
+    cfg = HKTrigger()
+    burst = 1000.0 + np.arange(60) * 0.5                  # 60 digits over 30 ns
+    noise = np.array([100.0, 3000.0])
+    gates = find_hk_trigger_gates(np.concatenate([burst, noise]), cfg)
+    t_trig = np.floor(burst[42] / 5.0) * 5.0              # the 43rd digit, 1021 -> 1020
+    np.testing.assert_allclose(gates, [[t_trig - 400.0, t_trig + 950.0]])
+    # 42 digits never fire
+    assert find_hk_trigger_gates(burst[:42], cfg).shape == (0, 2)
+
+
+def test_hk_late_light_triggers_separately_and_gates_do_not_overlap():
+    """A burst after the gate (a Michel electron) is its own trigger; a burst just after the
+    gate's end gets a gate truncated to start where the previous one ended."""
+    cfg = HKTrigger()
+    prompt = 1000.0 + np.arange(60) * 0.5
+    michel = 3000.0 + np.arange(60) * 0.5
+    g = find_hk_trigger_gates(np.concatenate([prompt, michel]), cfg)
+    assert g.shape == (2, 2) and g[1, 0] == np.floor(michel[42] / 5) * 5 - 400.0
+    close = 2000.0 + np.arange(60) * 0.5     # triggers at 2020, whose gate would open at 1620 < 1970
+    g2 = find_hk_trigger_gates(np.concatenate([prompt, close]), cfg)
+    assert g2.shape == (2, 2)
+    assert g2[1, 0] == g2[0, 1]                           # truncated: starts at the previous end
+    assert g2[1, 1] == np.floor(close[42] / 5) * 5 + 950.0
+
+
+def test_hk_search_counts_only_digits_after_the_gate():
+    """Digits read out by one trigger do not count towards the next (WCSim restarts its
+    window at the gate's end), so 42 digits after the gate plus earlier ones do not fire."""
+    cfg = HKTrigger()
+    prompt = 1000.0 + np.arange(60) * 0.5
+    end = np.floor(prompt[42] / 5) * 5 + 950.0
+    tail = end + 1.0 + np.arange(42) * 0.5                # 42 digits just after the gate
+    edge = end - 5.0 + np.arange(10) * 0.1                # inside the gate, within 200 ns of tail
+    g = find_hk_trigger_gates(np.concatenate([prompt, edge, tail]), cfg)
+    assert g.shape == (1, 2)
+
+
+def test_hk_from_block_and_apply_trigger():
+    assert isinstance(trigger_from_block({"model": "hk"}), HKTrigger)
+    assert isinstance(trigger_from_block({"n_thr": 25}), TriggerConfig)
+    assert trigger_from_block(None) is None
+    cfg = trigger_from_block({"model": "hk", "threshold": 5, "noise_dark_rate_khz": 0.0})
+    assert cfg.n_thr == 6
+    T = np.concatenate([1000.0 + np.arange(12), 5000.0 + np.arange(12), [3000.0]])
+    sd, hits, seg = _synth_event(np.arange(T.size) % 30, T)
+    nsd, nhits, nseg, pw = apply_trigger(sd, hits, seg, cfg)
+    assert pw["window_start"].shape[0] == 2
+    assert nsd["T"].shape[0] == 24                         # the lone digit at 3000 is out of both gates
+    assert sorted(nhits["digit_idx"].tolist()) == list(range(24))
 
 
 def _run_all():

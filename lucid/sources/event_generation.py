@@ -34,7 +34,7 @@ from lucid.sources.event_builder import (
     run_event_process_pipeline,
 )
 from lucid.simulation.digitizer import digitize_and_decompose, resolve_model_config
-from lucid.simulation.trigger import TriggerConfig, apply_trigger
+from lucid.simulation.trigger import apply_trigger, trigger_from_block
 from lucid.sources.scintillation_photons import expand_segments_to_photons
 from lucid.sources.writer import (
     EMISSION_PROCESS_CHERENKOV,
@@ -95,7 +95,7 @@ def _trigger_config_meta(cfg):
     """Trigger provenance for the four-file ``config/`` attrs."""
     if cfg is None:
         return {'trigger': 'none'}
-    return {'trigger': 'sliding_window',
+    return {'trigger': cfg.name,
             'trigger_window_ns': float(cfg.window_ns),
             'trigger_n_thr': int(cfg.n_thr),
             'trigger_pad_before_ns': float(cfg.pad_before_ns),
@@ -310,7 +310,7 @@ def generate_events_from_photonsim_particles(event_simulator, root_file_path,
     print(f"  Using rays buckets: {list(pad_size_buckets)}")
 
     digitizer_model = resolve_model_config(digitizer)
-    trigger_cfg = TriggerConfig.from_block(trigger)
+    trigger_cfg = trigger_from_block(trigger)
 
     print(f"\nGenerating {n_events} events using VMAP-OPTIMIZED particle-based processing...")
     print(f"Using batch size of {batch_size} events for multithreaded I/O")
@@ -1015,7 +1015,7 @@ def generate_events_from_photonsim_pileup(
     print(f"Pile-up: master_seed={master_seed}, job_id={job_id}, "
           f"n_vertices={N_vertices}")
     digitizer_model = resolve_model_config(digitizer)
-    trigger_cfg = TriggerConfig.from_block(trigger)
+    trigger_cfg = trigger_from_block(trigger)
     print(f"Digitizer model: {digitizer_model['model']} "
           f"(dark_rate_khz={digitizer_model.get('dark_rate_khz', 0.0)})")
     if trigger_cfg is not None:
@@ -1576,7 +1576,7 @@ def generate_events_from_photonsim_supernova(
 
     master_seed = _resolve_master_seed(master_seed)
     digitizer_model = resolve_model_config(digitizer)
-    trigger_cfg = TriggerConfig.from_block(trigger)
+    trigger_cfg = trigger_from_block(trigger)
     # Supernova requires a windowed digitizer (ski/hk) and the truth-based
     # selection (min_physics_hits) — the real readout trigger can't tag the
     # low-energy SN interactions. Fail early (before sntools/PhotonSim) rather
