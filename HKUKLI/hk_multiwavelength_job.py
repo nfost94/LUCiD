@@ -2,8 +2,9 @@
 
 The paper's calibration recipe (analysis/paper/utils/calib_run.py: CalibrationParams,
 closure_data, calibrate) on HK geometry, with the HK laser wavelengths, WCSim optics and real
-injector diffusers. Scattering, absorption and QE are free per wavelength; wall / PMT reflection
-(rate and specular fraction) and the per-PMT gains are shared across wavelengths. Mie is off.
+injector diffusers. Scattering, absorption and QE are free per wavelength; the wall reflection rate
+and the per-PMT gains are shared across wavelengths. PMT reflection is held at its known value.
+Mie is off.
 """
 import argparse
 import os
@@ -29,19 +30,23 @@ def main():
     from lucid.simulation import setup_event_simulator
     from lucid.fitting import CalibrationParams, CalibrationForward, calibrate, closure_data
     from hk_injector_sources import injector_sources, load_injectors
-    from hk_wcsim_params import WCSIM_BY_WAVELENGTH
+    from hk_wcsim_params import REFLECTION, WCSIM_BY_WAVELENGTH
 
     # ---- configuration (edit here) ----
-    GEOM = '../config/HK_geom_config.json'
+    # The HK WAND setup: cap PMTs (expose height 0.18 m), whose hard-mode deposit is exact only
+    # with the leg bound on (as in production); truth from HK_WAND_physics_config.json.
+    GEOM = '../config/HK_WAND_geom_config.json'
     WAVELENGTHS = [337, 355, 375, 395, 440, 500]       # HK laser system
     INJ_IDX = ['5', '14', '23', '28', '32']             # diffusers: 3 barrel + top + bottom
     INTENSITY = 1e8                                      # photons per source per wavelength
     N_RAYS, K = 1_000_000, 12
     GRID = dict(n_cap=200, n_angular=300, n_height=200)
     # WCSim reflection, shared across wavelengths: blacksheet 0.045 x bsrff 2.5 (diffuse) and
-    # glass/cathode rgcff 0.32 (specular). Fractions sit just inside (0, 1): the fit uses logit(f).
-    WALL_R, WALL_FSPEC, SENSOR_R, SENSOR_FSPEC = 0.1125, 0.01, 0.32, 0.99
-    FIT_SPECULAR_FRACTIONS = False                       # False: hold f_w, f_s at truth
+    # glass/cathode rgcff 0.32 (specular), as the WAND config sets them. Fractions sit just inside
+    # (0, 1): the fit uses logit(f).
+    WALL_R, WALL_FSPEC = REFLECTION['wall_reflection_rate'], REFLECTION['wall_fspec']
+    SENSOR_R, SENSOR_FSPEC = REFLECTION['sensor_reflection_rate'], REFLECTION['sensor_fspec']
+    FIT_WALL_FSPEC = False                               # False: hold f_w at truth
     QE_SPREAD = 0.05                                     # truth per-PMT gain spread (paper value)
     # paper recipe (calib_run.run_seed defaults)
     STEPS, REFRESH, JACOBIAN_DRAWS, TRUTH_DRAWS, POLYAK = 200, 20, 8, 100, 50
@@ -52,7 +57,10 @@ def main():
     # Jacobian refresh schedule: every REFRESH_EARLY steps for the first REFRESH_SWITCH fraction of
     # the run (while parameters move fast), then every REFRESH. REFRESH_EARLY = REFRESH: constant.
     REFRESH_EARLY, REFRESH_SWITCH = 5, 0.2
-    MAX_STEP, LAM, MU = 0.5, 0.01, 0.1
+    # Damping A = H + LAM·diag(H) + MU·median(diag H)·I. MU's isotropic term swamps the weakly
+    # constrained directions (UV absorption, in its absorption-QE valley); LAM damps each
+    # direction relative to its own curvature. Paper recipe: MU = 0.1.
+    MAX_STEP, LAM, MU = 0.5, 0.01, 0.01
     # Fractional variance (frac*Q)^2 added to the Neyman weight: caps each bright PMT's pull at
     # ~1/FRAC^2 Poisson-equivalent counts (near-injector hot spots). 0: the published estimator.
     FRAC = 0.0
@@ -68,7 +76,7 @@ def main():
 
     sim = setup_event_simulator(GEOM, N_RAYS, temperature=None, K=K, is_calibration=True,
                                 hit_mode='aggregated', wavelength_mode=False,
-                                reflection_model='scalar_mix', **GRID)
+                                reflection_model='scalar_mix', deposit_leg_bound=True, **GRID)
 
     W = len(WAVELENGTHS)
     params = CalibrationParams(n_wavelengths=W, basis='rlogit')
@@ -111,7 +119,8 @@ def main():
             [dict(scatter_length=f[3 * w], absorption_length=f[3 * w + 1], qe=f[3 * w + 2])
              for w in range(W)], *f[NG:NG + 4]), dtype=float)
         print(f'resuming from {args.resume}', flush=True)
-    fix = () if FIT_SPECULAR_FRACTIONS else (NG + 1, NG + 3)
+    # PMT reflection is known: sensor_R and sensor_fspec are held at truth.
+    fix = (NG + 2, NG + 3) + (() if FIT_WALL_FSPEC else (NG + 1,))
     for j in fix:
         start[j] = theta_true[j]
     free = np.array([j not in fix for j in range(P)])
