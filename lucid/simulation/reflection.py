@@ -601,6 +601,39 @@ def tuned_wall_only_reflection(
         enable_sensor=False, polarization=polarization)
 
 
+def tabulated_lambertian_reflection(
+        direction, normal, hit_sensor, refl_params, lam, key,
+        polarization=None):
+    """Tabulated PMT reflection with a flat Lambertian wall, WCSim's blacksheet.
+
+    WCSim's blacksheet (OpWaterBSSurface: groundfrontpainted, EFFICIENCY 0) reflects with a
+    probability set by wavelength alone, and in a Lambertian direction about the wall normal
+    whatever the incoming direction (G4LambertianRand). Here that probability is flat:
+    ``wall_scale`` is the wall reflectance itself. The PMT is the tabulated models': ``sensor_scale``
+    times the table reflectance, specular, with detection applied separately from the table's
+    absorptance (``pmt_detection``). Its s/p weighting, when polarisation is tracked, follows the
+    tabulated models' SK-IV column convention.
+    """
+    normal_refl = sg(normal)
+    cth_inc = jnp.clip(jnp.abs(jnp.sum(direction * normal_refl)), 0.0, 1.0)
+    sensor_reflectance = tabulated_pmt_reflectance(
+        cth_inc, lam, refl_params.pmt_reflectance_table)
+    pmt_s = refl_params.pmt_reflectance_s
+    pmt_p = refl_params.pmt_reflectance_p
+    if polarization is not None and pmt_s is not None and pmt_p is not None:
+        p_table_weight = _sk4_p_table_weight(direction, normal_refl, polarization)
+        sensor_reflectance = (
+            p_table_weight * tabulated_pmt_reflectance(cth_inc, lam, pmt_p)
+            + (1.0 - p_table_weight) * tabulated_pmt_reflectance(cth_inc, lam, pmt_s))
+    refl_prob = jnp.where(hit_sensor, refl_params.sensor_scale * sensor_reflectance,
+                          refl_params.wall_scale)
+
+    specular_dir = compute_reflection_direction(direction, normal_refl)
+    lambert_dir = sample_cosine_hemisphere(-normal_refl, key)
+    refl_dir = jnp.where(hit_sensor, specular_dir, lambert_dir)
+    return jnp.clip(refl_prob, 0.0, 0.999), refl_dir, jnp.zeros_like(refl_prob)
+
+
 # ---------------------------------------------------------------------------
 # Model registry — name → (reflection_fn, build_refl_params(detector_params)).
 # build_refl_params extracts the model's parameters from a DetectorParams pytree.
@@ -656,12 +689,13 @@ REFLECTION_MODELS = {
     'tabulated_scaled': (tabulated_scaled_reflection, _build_tabulated_scaled_params),
     'tabulated_pmt_only': (tabulated_pmt_only_reflection, _build_tabulated_tuned_params),
     'tuned_wall_only': (tuned_wall_only_reflection, _build_tabulated_tuned_params),
+    'tabulated_lambertian': (tabulated_lambertian_reflection, _build_tabulated_scaled_params),
 }
 
 # Reflection models that require a per-photon wavelength (→ wavelength_mode=True).
 WAVELENGTH_REFLECTION_MODELS = frozenset({
     'angular', 'tabulated_tuned', 'tabulated_scaled',
-    'tabulated_pmt_only', 'tuned_wall_only',
+    'tabulated_pmt_only', 'tuned_wall_only', 'tabulated_lambertian',
 })
 
 # The SK-like model treats photocathode absorption (direct PE response) and reflection
@@ -669,7 +703,7 @@ WAVELENGTH_REFLECTION_MODELS = frozenset({
 # per candidate PMT while photon transport independently continues R(theta).
 INDEPENDENT_SENSOR_DETECTION_MODELS = frozenset({
     'tabulated_tuned', 'tabulated_scaled',
-    'tabulated_pmt_only', 'tuned_wall_only',
+    'tabulated_pmt_only', 'tuned_wall_only', 'tabulated_lambertian',
 })
 
 
