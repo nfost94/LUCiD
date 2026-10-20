@@ -1,20 +1,22 @@
 {
-  "_comment": "Frozen HK detector description for the WAND production. Pinned so edits to HK_physics_config.json cannot silently change the campaign. Values match those used for WAND/HK/GeV in 2026-07; fspec is written out explicitly rather than inherited from detector_params._ANGULAR_REFL_DEFAULTS.",
-  "medium_model": "materials/water.json",
-  "qe_curve": "pmt/HK_QE.json",
-  "wall_reflection_rate": 0.2,
-  "sensor_reflection_rate": 0.2,
-  "wall_fspec": 0.55,
-  "sensor_fspec": 0.9,
+  "_comment": "Frozen HK detector description for the WAND production, aligned with the WCSim HK production (WCSim v1.12.34, run_macros/particle_iso_e.mac + tuning_parameters.mac). Pinned so edits to HK_physics_config.json cannot silently change the campaign. Water: WCSim's tables x abwff 1.30 / rayff 0.75, no Mie (materials/water_wcsim.json). QE: WCSim's net detection per photon reaching the PMT (pmt/HK_QE_wcsim.json), paired with the glass/cathode reflectivity rgcff 0.32 (specular). Blacksheet: 0.045 x bsrff 2.5 = 0.1125 (WCSim's value up to 395 nm; 0.145 / 0.1375 at 440 / 500 nm), diffuse. Specular fractions sit just inside (0, 1), as the calibration fit (HKUKLI/hk_multiwavelength_job.py) needs for logit(f).",
+  "medium_model": "materials/water_wcsim.json",
+  "qe_curve": "pmt/HK_QE_wcsim.json",
+  "wall_reflection_rate": 0.1125,
+  "sensor_reflection_rate": 0.32,
+  "wall_fspec": 0.01,
+  "sensor_fspec": 0.99,
   "qe_corrections": 1.0,
   "digitizer": {
-    "model": "hk"
+    "_note": "WCSim SKI digitizer as the HK production macro sets it: DeadTime 560 ns, TimingPrecision 0.1 ns, PEPrecision 0.3; dark rate 4.2 kHz x SetConvert 1.1125 (pulses before the threshold curve, which keeps ~90% of them).",
+    "model": "hk",
+    "deadtime_ns": 560.0,
+    "tdc_ns": 0.1,
+    "pe_precision": 0.3,
+    "dark_rate_khz": 4.6725
   },
   "trigger": {
-    "_note": "HK high-E real trigger - validated on muons (muon 99.9%, Michel 99.4% hits kept, 0 dark windows) and config_18 pile-up (99.97% physics hits kept, 0 dark windows).",
-    "window_ns": 200.0,
-    "n_thr": 45,
-    "pad_before_ns": 300.0,
-    "pad_after_ns": 300.0
+    "_note": "WCSim NDigits as the HK production runs it (HKTrigger defaults): threshold 25 + noise adjustment = 42, window 200 ns, readout -400 / +950 ns.",
+    "model": "hk"
   }
 }
