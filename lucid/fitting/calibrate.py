@@ -60,7 +60,7 @@ def calibrate(sim, sources, params, data, theta0, *,
               q_floor=None, q_floor_frac=0.01, gauge='log', fix=(), seed=0,
               lr=1.0, lr_final=None, scale=None, readout='final', polyak=0,
               map_fn=None, predict=None, forward=None, on_step=None,
-              tx=None, needs_metric=True, frac=0.0, response=None, data_var=None):
+              tx=None, needs_metric=True, response=None, data_var=None):
     """Fit detector parameters to observed per-sensor charge.
 
     Parameters
@@ -98,16 +98,15 @@ def calibrate(sim, sources, params, data, theta0, *,
         variance of the model. The Neyman residual is linear in ``M``, so on its own averaging
         would not move the fixed point; the knob matters because the profiled gain
         ``k = ΣQ/ΣM`` is nonlinear in ``M``. See :func:`~lucid.fitting.calib.profile_gains`.
+        With two or more draws the gains and the model charge are jackknifed over them
+        (:func:`~lucid.fitting.calib.jackknife_profile`), which cancels that bias's 1/n term; one
+        draw is profiled as it stands.
     jacobian_draws : int
         Jacobian draws averaged per refresh, on a stream independent of the residual's.
     q_floor, q_floor_frac
         Floor on the Neyman weight's denominator, absolute or as a fraction of ``mean(data)``.
         It exists because ``1/sqrt(Q)`` diverges on an empty sensor: without it a handful of nearly
         unlit sensors dominate the fit.
-    frac : float
-        Fractional uncertainty added to the Neyman variance, ``clip(Q, floor) + (frac·Q)²``: the
-        bright-sensor counterpart of ``q_floor``, capping each sensor's pull at about ``1/frac²``
-        counts (see :func:`lucid.fitting.calib.neyman_variance`). 0 (default) is unchanged.
     gauge : ``'log'`` or ``'linear'``
         Gain gauge; see :func:`lucid.fitting.calib.profile_gains`.
     response : :class:`~lucid.fitting.calib.PulseResponse` or None
@@ -165,7 +164,7 @@ def calibrate(sim, sources, params, data, theta0, *,
 
     prob = CalibrationProblem(fwd, jac, params, data, q_floor, gauge=gauge,
                               n_forward_draws=n_forward_draws, jacobian_draws=jacobian_draws,
-                              forward_key0=fkey, frac=frac, response=response, data_var=data_var)
+                              forward_key0=fkey, response=response, data_var=data_var)
     th0 = jnp.asarray(theta0, dtype=jnp.float32)
     if tx is None:
         # The published path. `tx=None` must reach exactly this call: it is the configuration
@@ -314,7 +313,7 @@ _RETIRED = {
 
 def fit(sources, truth_list, theta0, n_sensors, *, steps=300, refresh=15,
         lam=0.01, mu=0.1, max_step=0.08, n_forward_draws=1, jacobian_draws=4,
-        q_floor_frac=0.01, gauge='log', fix=(), seed=0, polyak=0, frac=0.0, **retired):
+        q_floor_frac=0.01, gauge='log', fix=(), seed=0, polyak=0, **retired):
     """Calibrate through the field-based bridge: one ``SourceModel`` forward per source.
 
     This is what :func:`lucid.fitting.problem.build_calibration_problem` produces, so the pairing
@@ -332,9 +331,6 @@ def fit(sources, truth_list, theta0, n_sensors, *, steps=300, refresh=15,
 
     ``polyak`` selects the averaged readout: the trajectory does not settle, it wanders on the
     Monte-Carlo noise floor, so the mean of the last few iterates is usually the honest answer.
-
-    ``frac`` is the fractional uncertainty in the Neyman variance (see :func:`calibrate`); pass the
-    same value to :func:`lucid.fitting.fisher.crb` so the bound describes the same likelihood.
 
     Returns the :func:`calibrate` result, plus ``k`` (the profiled gains), ``log_theta``, and
     ``theta`` in physical units — the keys the bridge's callers read.
@@ -363,7 +359,7 @@ def fit(sources, truth_list, theta0, n_sensors, *, steps=300, refresh=15,
                     n_forward_draws=n_forward_draws, jacobian_draws=jacobian_draws,
                     q_floor_frac=q_floor_frac, gauge=gauge, fix=fix, seed=seed,
                     readout='polyak' if polyak else 'final', polyak=polyak,
-                    predict=predict, frac=frac)
+                    predict=predict)
     log_theta = np.asarray(res['theta'], dtype=float)
     res.update(theta=np.exp(log_theta), log_theta=log_theta, k=res['gains'])
     return res

@@ -208,6 +208,13 @@ class CalibrationForward:
             acc = acc + self(theta, key_base + 131 * b, gains)
         return acc / n_draws
 
+    def draws(self, theta, key_base, gains, n_draws):
+        """The ``n_draws`` draws :meth:`average` averages, each kept: ``(n_draws, S, NS)``.
+
+        Same keys as :meth:`average`, for :func:`jackknife_profile`, which needs them apart.
+        """
+        return jnp.stack([self(theta, key_base + 131 * b, gains) for b in range(n_draws)])
+
 
 class CalibrationJacobian:
     """``∂r/∂θ`` for the Neyman residual — differentiated as ONE fused expression.
@@ -394,7 +401,9 @@ def profile_gains(model_charge, observed_sum, gauge='log', clip_min=1e-6):
 
 
 def _gauge_gains(k, gauge):
-    """Apply the gain gauge (see :func:`profile_gains`)."""
+    """Apply the gain gauge (see :func:`profile_gains`); ``None`` leaves the gains ungauged."""
+    if gauge is None:
+        return k
     if gauge == 'linear':
         return k / jnp.mean(k)
     if gauge == 'log':
@@ -402,33 +411,65 @@ def _gauge_gains(k, gauge):
     raise ValueError(f"gauge must be 'log' or 'linear', got {gauge!r}")
 
 
-def neyman_variance(data, q_floor, frac=0.0, data_var=None):
-    """The per-sensor variance in the Neyman weight: ``clip(Q, floor) + (frac·Q)²``.
+def jackknife_profile(draws, observed_sum, gauge='log', response=None, wl=None, clip_min=1e-6):
+    """Profiled gains and model charge from ``n >= 2`` forward draws, with their 1/n bias removed.
 
-    ``frac`` is a fractional (model/systematic) uncertainty. It leaves dim sensors at their
-    Poisson weight and caps a bright sensor's pull at about ``1/frac²`` Poisson-equivalent counts,
-    so a few hundred narrow-beam spot PMTs cannot dominate the fit. Still data-only. ``frac=0``
-    returns ``clip(Q, floor)`` itself, so the published estimator is unchanged bit for bit.
+    Profiling the gains, ``k = ΣQ / ΣM``, puts the forward's Monte-Carlo charge in a denominator,
+    so the model the residual compares, ``k·M``, is a ratio of noisy charges. Its expectation sits
+    ``∝ var(M) ∝ 1/n`` off its value at the mean model (Jensen), most on dim sensors: the bias
+    ``tests/test_fitting_estimator_unbiased.py`` measures. The jackknife cancels that term from the
+    draws already in hand. For any estimate ``f`` made from all ``n`` draws and ``f_(-i)`` made
+    from the ``n - 1`` others,
+
+        f_JK = n·f − (n − 1)·mean_i f_(-i),
+
+    leaving O(1/n²). It is applied to the model charge, which is what enters the (linear) residual;
+    jackknifing the gains alone does not remove the bias, because the model carries the
+    covariance of the gains with the charges they multiply. The gains are jackknifed too, for the
+    gain map a calibration reports and the Jacobian.
+
+    ``draws`` is ``(n, S, NS)`` (:meth:`CalibrationForward.draws`). With a ``response``
+    (:class:`PulseResponse`) each gain is its Newton profile on the pulse-sum model, ``wl`` its
+    rows' wavelength indices, and the model its pulse-sum charge. Returns ``(k, model)``.
+    """
+    n = draws.shape[0]
+    if n < 2:
+        raise ValueError(f'the jackknife needs at least two forward draws, got {n}')
+    total = draws.sum(0)
+    loo = (total[None] - draws) / (n - 1)                     # each draw left out
+
+    def profiled(m):
+        if response is None:
+            k = profile_gains(m.sum(0) + 1e-12, observed_sum, gauge=gauge, clip_min=clip_min)
+            return k, k[None, :] * m
+        k = response.profile_gains(m, observed_sum, wl, gauge=gauge, clip_min=clip_min)
+        return k, response.charge(k[None, :] * m, wl)
+
+    k_all, model_all = profiled(total / n)
+    k_loo, model_loo = jax.vmap(profiled)(loo)
+    k = jnp.clip(n * k_all - (n - 1) * k_loo.mean(0), clip_min, None)
+    return k, n * model_all - (n - 1) * model_loo.mean(0)
+
+
+def neyman_variance(data, q_floor, data_var=None):
+    """The per-sensor variance in the Neyman weight: ``clip(Q, floor)``.
 
     ``data_var``, when given, replaces ``Q`` as the variance (still clipped at the floor): the
     measured variance of each sensor's charge, e.g. its pulse-to-pulse spread for a pulsed source,
     where digitized charge is not Poisson in photoelectrons. Still data-only.
     """
-    var = jnp.clip(data if data_var is None else data_var, q_floor, None)
-    if frac:
-        var = var + (frac * data) ** 2
-    return var
+    return jnp.clip(data if data_var is None else data_var, q_floor, None)
 
 
-def neyman_residual(model_charge, data, q_floor, frac=0.0, data_var=None):
-    """``r = (k·M − Q) / √(clip(Q, floor) + (frac·Q)²)`` — see :func:`neyman_variance`.
+def neyman_residual(model_charge, data, q_floor, data_var=None):
+    """``r = (k·M − Q) / √clip(Q, floor)`` — see :func:`neyman_variance`.
 
     The weight depends on the DATA only. That is the whole point: the forward model is a
     Monte-Carlo estimate redrawn every step, so a weight involving ``M`` would make the residual
     nonlinear in it and bias the gradient — permanently displacing the fixed point rather than
     merely adding noise. Neyman is the member of the χ² family whose weight is data-only.
     """
-    return (model_charge - data) / jnp.sqrt(neyman_variance(data, q_floor, frac, data_var))
+    return (model_charge - data) / jnp.sqrt(neyman_variance(data, q_floor, data_var))
 
 
 class PulseResponse:
@@ -515,7 +556,7 @@ class CalibrationProblem:
 
     def __init__(self, forward, jacobian, params, data, q_floor, *,
                  gauge='log', n_forward_draws=1, jacobian_draws=2,
-                 forward_key0=1000, forward_key_stride=13, frac=0.0,
+                 forward_key0=1000, forward_key_stride=13,
                  response=None, data_var=None):
         self.forward = forward
         self.jacobian = jacobian
@@ -523,7 +564,6 @@ class CalibrationProblem:
         self.data = data                                   # (S, NS) observed charge
         self.data_sum = data.sum(0)
         self.q_floor = float(q_floor)
-        self.frac = float(frac)
         # A PulseResponse (or None: the model is the gain times the forward) and the measured
         # variance of the data (or None: Q itself; see neyman_variance). The response must be the
         # one the Jacobian was built with.
@@ -532,11 +572,9 @@ class CalibrationProblem:
         self._wl_rows = None if response is None else (
             jnp.arange(data.shape[0]) // forward.n_sources)[:, None]
         # The Jacobian uses its data argument only as the weight's variance, √clip(·, floor). Handing
-        # it the full Neyman variance (which is already >= floor) makes J weight exactly as r does.
-        if self.data_var is None:
-            self._q_jac = data if not self.frac else neyman_variance(data, self.q_floor, self.frac)
-        else:
-            self._q_jac = neyman_variance(data, self.q_floor, self.frac, self.data_var)
+        # it the measured variance (when there is one) makes J weight exactly as r does.
+        self._q_jac = data if self.data_var is None else neyman_variance(data, self.q_floor,
+                                                                          self.data_var)
         self.gauge = gauge
         self.n_forward_draws = int(n_forward_draws)
         self.jacobian_draws = int(jacobian_draws)
@@ -552,6 +590,19 @@ class CalibrationProblem:
         """Apply a step, preserving the reference's float32 iterate (see the class docstring)."""
         return theta + jnp.asarray(dtheta)
 
+    def _forward_gains_model(self, theta, step):
+        """-> ``(k, model charge)`` at ``theta`` on step ``step``'s forward draws.
+
+        One draw: the gains profiled on it. Two or more: their jackknife (:func:`jackknife_profile`),
+        which removes the profiling's 1/n bias.
+        """
+        ones = jnp.ones(self.data.shape[1])
+        if self.n_forward_draws < 2:
+            mu = self.forward.average(theta, self.forward_key(step), ones, self.n_forward_draws)
+            return self._profiled_model(mu)
+        draws = self.forward.draws(theta, self.forward_key(step), ones, self.n_forward_draws)
+        return jackknife_profile(draws, self.data_sum, self.gauge, self.response, self._wl_rows)
+
     def _profiled_model(self, mu):
         """-> ``(k, model charge)``: the profiled gains and the model the residual compares."""
         if self.response is None:
@@ -561,10 +612,8 @@ class CalibrationProblem:
         return k, self.response.charge(k[None, :] * mu, self._wl_rows)
 
     def grad_metric_loss(self, theta, step, refresh=True):
-        ones = jnp.ones(self.data.shape[1])
-        mu = self.forward.average(theta, self.forward_key(step), ones, self.n_forward_draws)
-        k, model = self._profiled_model(mu)
-        r = neyman_residual(model, self.data, self.q_floor, self.frac, self.data_var)
+        k, model = self._forward_gains_model(theta, step)
+        r = neyman_residual(model, self.data, self.q_floor, self.data_var)
 
         if refresh or self._J is None:
             self._J = self.jacobian(theta, jnp.log(k), step, self._q_jac, self.q_floor,
@@ -582,9 +631,7 @@ class CalibrationProblem:
         A detector calibration wants these: they are the per-sensor QE/gain map. They never enter
         ``theta``, so a caller that only reads the fit vector would never see them.
         """
-        ones = jnp.ones(self.data.shape[1])
-        mu = self.forward.average(theta, self.forward_key(step), ones, self.n_forward_draws)
-        return self._profiled_model(mu)[0]
+        return self._forward_gains_model(theta, step)[0]
 
 
 def _group_by_structure(sources):

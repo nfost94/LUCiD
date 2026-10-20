@@ -140,3 +140,69 @@ def test_the_sqrt_residuals_displacement_grows_with_noise(z_scores):
     hi = z_scores[(NOISE_HI, 'sqrt', 'fixed')]
     lo = z_scores[(NOISE_LO, 'sqrt', 'fixed')]
     assert hi > lo, f'sqrt displacement does not grow with forward noise ({lo:.1f} -> {hi:.1f})'
+
+
+# --- the jackknife ---------------------------------------------------------------------------------
+# With n >= 2 forward draws CalibrationProblem jackknifes the profiled model over them
+# (jackknife_profile), which should cancel the profiling bias's 1/n term. Measured here as the
+# mean gradient at truth with n = 4: plain profiling of the 4-draw mean against the jackknife.
+
+N_JK_STEPS = 400
+
+
+@pytest.fixture(scope='module')
+def jackknife_gradients():
+    from lucid.fitting import jackknife_profile
+    params = FieldParams(_dp_true(), FIELDS, n_sensors=NS)
+    th = jnp.asarray(params.theta_from_physical(), dtype=jnp.float32)
+    gains = np.exp(0.15 * np.random.default_rng(5).standard_normal(NS))
+    gains /= np.exp(np.mean(np.log(gains)))
+    ones = jnp.ones(NS)
+    data = CalibrationForward(_clean, _sources(), params, NS)(th, 5000, jnp.asarray(gains))
+
+    out = {}
+    for noise in (NOISE_HI, NOISE_LO):
+        sim = _make_noisy(noise)
+        fwd = CalibrationForward(sim, _sources(), params, NS)
+        jac = CalibrationJacobian(sim, _sources(), params, NS, key0=9_000_000)
+        prob = CalibrationProblem(fwd, jac, params, data, 1e-6, n_forward_draws=4, jacobian_draws=1)
+        for mode in ('plain', 'jackknife'):
+            g = []
+            for step in range(N_JK_STEPS):
+                d = fwd.draws(th, prob.forward_key(step), ones, 4)
+                if mode == 'plain':
+                    mu = d.mean(0)
+                    k = profile_gains(mu.sum(0) + 1e-12, prob.data_sum)
+                    model = k[None, :] * mu
+                else:
+                    k, model = jackknife_profile(d, prob.data_sum)
+                r = (model - data) / jnp.sqrt(jnp.clip(data, 1e-6, None))
+                j = jac(th, jnp.log(k), step, data, 1e-6, draws=(0,))
+                g.append(np.asarray(jnp.einsum('gnp,gn->p', j, r) / prob.n_configs))
+            g = np.stack(g)
+            out[(noise, mode)] = (g.mean(0), g.std(0, ddof=1) / np.sqrt(len(g)))
+    return out
+
+
+def test_the_jackknife_removes_the_profiling_bias(jackknife_gradients):
+    """At high forward noise the jackknifed bias is a small fraction of plain profiling's (the
+    O(1/n²) remainder); at low noise the jackknifed gradient at truth is consistent with zero."""
+    plain, _ = jackknife_gradients[(NOISE_HI, 'plain')]
+    jk, _ = jackknife_gradients[(NOISE_HI, 'jackknife')]
+    assert np.max(np.abs(jk)) < 0.15 * np.max(np.abs(plain)), (jk, plain)
+    jk, sem = jackknife_gradients[(NOISE_LO, 'jackknife')]
+    z = np.max(np.abs(jk) / sem)
+    assert z < 4.0, f'jackknifed gradient at truth is {z:.1f} sigma from zero at noise {NOISE_LO}'
+
+
+def test_the_jackknife_of_identical_draws_is_the_plain_profile():
+    from lucid.fitting import jackknife_profile
+    rng = np.random.default_rng(1)
+    mu = jnp.asarray(rng.uniform(0.5, 5.0, (6, NS)), dtype=jnp.float32)
+    data_sum = jnp.asarray(rng.uniform(5.0, 30.0, NS), dtype=jnp.float32)
+    k, model = jackknife_profile(jnp.stack([mu] * 4), data_sum)
+    k0 = profile_gains(mu.sum(0) + 1e-12, data_sum)
+    np.testing.assert_allclose(np.asarray(k), np.asarray(k0), rtol=1e-5)
+    np.testing.assert_allclose(np.asarray(model), np.asarray(k0[None, :] * mu), rtol=1e-5)
+    with pytest.raises(ValueError):
+        jackknife_profile(mu[None], data_sum)

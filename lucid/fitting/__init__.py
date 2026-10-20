@@ -47,7 +47,7 @@ the per-PMT gains by Schur complement rather than profiling them, for that reaso
 from lucid.fitting.params import CalibrationParams, FieldParams, LogParams
 from lucid.fitting.calib import (
     CalibrationForward, CalibrationJacobian, CalibrationProblem, PulseResponse,
-    profile_gains, neyman_residual,
+    profile_gains, jackknife_profile, neyman_residual,
 )
 from lucid.fitting.gn import gauss_newton
 from lucid.fitting.calibrate import calibrate, closure, closure_data, fit, pulsed_closure_data

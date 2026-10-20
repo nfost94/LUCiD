@@ -30,7 +30,7 @@ SQRT12 = float(np.sqrt(12.0))
 
 
 def crb(sources, theta_true, n_sensors, *, lk_true=None, weights=None,
-        nphot=None, nb_h=3, honesty=SQRT12, ridge_rel=1e-9, frac=0.0,
+        nphot=None, nb_h=3, honesty=SQRT12, ridge_rel=1e-9,
         marginalize_k=True):
     """Cramér-Rao bound on the global parameters at ``theta_true``.
 
@@ -49,10 +49,6 @@ def crb(sources, theta_true, n_sensors, *, lk_true=None, weights=None,
         Per-source photon count scaling the Poisson Fisher (defaults ones).
     honesty : float
         σ inflation for the implicit engine's reduced variance (default √12).
-    frac : float
-        Fractional uncertainty matching ``fit(frac=...)``: the variance becomes ``μ + (frac·μ)²``,
-        so each sensor's Poisson information is scaled by ``1/(1 + frac²·μ)``. 0 (default) is
-        unchanged.
     marginalize_k : bool
         Marginalise a free per-PMT multiplicative factor when True (the multi-source
         calibration default). Set False when those factors are fixed, as required for a
@@ -82,8 +78,6 @@ def crb(sources, theta_true, n_sensors, *, lk_true=None, weights=None,
         mi = np.array(sources[i].m(theta, lk, *_keys(7_000_000 + 1000 * i)))
         Jk = 0.5 * mi
         w = Nphot[i] * W
-        if frac:
-            w = w / (1.0 + frac ** 2 * mi ** 2)            # mi = √(kM), so mi² is the mean charge
         Htt += (Ji * w[:, None]).T @ Ji
         Htk += (Ji * w[:, None]).T * Jk[None, :]
         Hkk += w * (Jk * Jk)

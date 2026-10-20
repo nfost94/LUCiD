@@ -109,3 +109,18 @@ def test_closure_on_pulse_by_pulse_digitized_data():
     res = calibrate(_stub_sim, sources, params, data, start, response=resp, data_var=var,
                     **FIT_KW)
     np.testing.assert_allclose(np.asarray(res['theta']), np.asarray(theta_true), atol=2e-2)
+
+
+def test_the_pulsed_jackknife_of_identical_draws_is_the_newton_profile():
+    from lucid.fitting import jackknife_profile
+    rng = np.random.default_rng(2)
+    ns = 30
+    mu = jnp.asarray(rng.uniform(0.01, 2.0, (3, ns)))
+    resp = PulseResponse(HK, n_pulses=1000, pulse_scale=[1.0, 0.5], dark_mu=DARK)
+    wl = jnp.asarray([[0], [1], [1]])
+    data_sum = resp.charge(mu, wl).sum(0)
+    k, model = jackknife_profile(jnp.stack([mu] * 3), data_sum, response=resp, wl=wl)
+    k0 = resp.profile_gains(mu, data_sum, wl)
+    np.testing.assert_allclose(np.asarray(k), np.asarray(k0), rtol=1e-4)
+    np.testing.assert_allclose(np.asarray(model), np.asarray(resp.charge(k0[None, :] * mu, wl)),
+                               rtol=1e-4)
