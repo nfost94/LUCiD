@@ -679,3 +679,98 @@ def generate_dark_noise(
     times = rng.uniform(t_start_ns, t_end_ns, size=total)
     charges = np.full(total, float(charge_pe), dtype=np.float64)
     return sensor_idx, times, charges
+
+
+# --- Pulsed sources (calibration) --------------------------------------------
+# A calibration pulse puts a sensor's photoelectrons into one integration window, so its prompt
+# light is one digit; dark pulses spread over a readout far longer than the window are digits of
+# their own. Neither function below models the dead time (a dark pulse vetoing later light, ~rate
+# x deadtime ~0.3% for HK) or light arriving later than the window after the first photoelectron.
+
+def digit_charge_moments(model: dict, n_max: int, n_draws: int = 50_000,
+                         rng: Optional[np.random.Generator] = None):
+    """Moments of one digit's recorded charge given ``n`` photoelectrons, ``n = 0..n_max``.
+
+    The digit goes through this model's readout: the SPE charge sum (:func:`_sample_spe_charge`),
+    the discriminator (fires with :func:`discriminator_efficiency`, taken in expectation rather than
+    drawn) and the charge precision (:func:`apply_charge_precision`); a digit that does not fire
+    records 0. Returns ``(p_fire, mean, second_moment)``, each ``(n_max + 1,)``.
+    """
+    if model.get("charge_model") != "spe":
+        raise ValueError(f"digitizer model {model.get('model')!r} has no SPE charge response")
+    rng = np.random.default_rng(0) if rng is None else rng
+    p_fire = np.zeros(n_max + 1)
+    mean = np.zeros(n_max + 1)
+    second = np.zeros(n_max + 1)
+    for n in range(1, n_max + 1):
+        q = _sample_spe_charge(np.full(n_draws, float(n)), model["spe"], rng)
+        eff = discriminator_efficiency(q, model)
+        qr = np.asarray(apply_charge_precision(q, model), dtype=np.float64)
+        p_fire[n], mean[n], second[n] = eff.mean(), (eff * qr).mean(), (eff * qr ** 2).mean()
+    return p_fire, mean, second
+
+
+def pulse_charge_response(model: dict, mu, dark_mu: float = 0.0, n_draws: int = 50_000,
+                          rng: Optional[np.random.Generator] = None):
+    """Mean and variance of a sensor's recorded charge in one pulse, and its prompt-digit
+    probability, at ``mu`` expected photoelectrons per pulse plus ``dark_mu`` dark pulses.
+
+    Prompt light: Poisson(``mu``) photoelectrons in one digit (:func:`digit_charge_moments`).
+    Dark: Poisson(``dark_mu``) single-photoelectron digits, independent of it. Returns
+    ``(mean, var, p_hit)`` on ``mu``'s shape; smooth in ``mu`` though every stage is a hard cut.
+    """
+    from scipy.stats import poisson
+    mu = np.asarray(mu, dtype=np.float64)
+    top = float(mu.max(initial=0.0))
+    n_max = int(np.ceil(top + 10.0 * np.sqrt(top) + 10.0))
+    p1, m1, m2 = digit_charge_moments(model, n_max, n_draws, rng)
+    w = poisson.pmf(np.arange(n_max + 1), mu.reshape(-1, 1))
+    mean, second, p_hit = w @ m1, w @ m2, w @ p1
+    var = second - mean ** 2 + dark_mu * m2[1]
+    mean = mean + dark_mu * m1[1]
+    return mean.reshape(mu.shape), var.reshape(mu.shape), p_hit.reshape(mu.shape)
+
+
+def sample_pulse_charge_sums(mu, n_pulses: int, model: dict, rng: np.random.Generator,
+                             dark_mu: float = 0.0, max_draws: int = 20_000_000):
+    """Per-sensor sum and sum of squares of recorded charge over ``n_pulses`` pulses.
+
+    Each pulse gives sensor ``i`` Poisson(``mu[i]``) photoelectrons in one digit, through this
+    model's readout as :func:`digit_charge_moments` describes (the discriminator drawn), and
+    Poisson(``dark_mu``) single-photoelectron dark digits. Only pulses that put light on a sensor
+    are drawn. The sum of squares treats a pulse's prompt and dark digits as separate pulses,
+    leaving out their cross term: the per-pulse variance it implies is low by
+    ``2 x prompt mean x dark mean``, ~1% at 10 p.e. per pulse for HK and negligible below 1.
+    """
+    from scipy.stats import poisson
+    mu = np.asarray(mu, dtype=np.float64)
+    ns = mu.shape[0]
+    total = np.zeros(ns)
+    total_sq = np.zeros(ns)
+
+    def digits(sensor, n):
+        q = _sample_spe_charge(n, model["spe"], rng)
+        fire = rng.random(q.shape) < discriminator_efficiency(q, model)
+        q = np.where(fire, np.asarray(apply_charge_precision(q, model), dtype=np.float64), 0.0)
+        total[:] += np.bincount(sensor, weights=q, minlength=ns)
+        total_sq[:] += np.bincount(sensor, weights=q ** 2, minlength=ns)
+
+    p0 = np.exp(-mu)
+    lit = rng.binomial(n_pulses, 1.0 - p0)                 # pulses with prompt light, per sensor
+    dark = rng.poisson(n_pulses * dark_mu, size=ns)       # dark digits, per sensor
+    for counts, prompt in ((lit, True), (dark, False)):
+        bounds = np.concatenate([[0], np.cumsum(counts)])
+        start = 0
+        while start < ns:                                  # sensor chunks of <= max_draws digits
+            stop = int(np.searchsorted(bounds, bounds[start] + max_draws, side="right")) - 1
+            stop = max(stop, start + 1)
+            sensor = np.repeat(np.arange(start, stop), counts[start:stop])
+            if sensor.size:
+                if prompt:                                 # n | n >= 1, by inverse CDF
+                    u = rng.uniform(p0[sensor], 1.0)
+                    n = np.maximum(poisson.ppf(u, mu[sensor]), 1.0)
+                else:
+                    n = np.ones(sensor.size)
+                digits(sensor, n)
+            start = stop
+    return total, total_sq

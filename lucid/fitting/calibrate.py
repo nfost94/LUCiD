@@ -38,7 +38,7 @@ from lucid.fitting.gn import gauss_newton
 from lucid.fitting.minimize import minimize
 from lucid.fitting.params import LogParams
 
-__all__ = ['calibrate', 'closure', 'closure_data', 'fit']
+__all__ = ['calibrate', 'closure', 'closure_data', 'pulsed_closure_data', 'fit']
 
 
 def _seeded_keys(seed):
@@ -60,7 +60,7 @@ def calibrate(sim, sources, params, data, theta0, *,
               q_floor=None, q_floor_frac=0.01, gauge='log', fix=(), seed=0,
               lr=1.0, lr_final=None, scale=None, readout='final', polyak=0,
               map_fn=None, predict=None, forward=None, on_step=None,
-              tx=None, needs_metric=True, frac=0.0):
+              tx=None, needs_metric=True, frac=0.0, response=None, data_var=None):
     """Fit detector parameters to observed per-sensor charge.
 
     Parameters
@@ -110,6 +110,12 @@ def calibrate(sim, sources, params, data, theta0, *,
         counts (see :func:`lucid.fitting.calib.neyman_variance`). 0 (default) is unchanged.
     gauge : ``'log'`` or ``'linear'``
         Gain gauge; see :func:`lucid.fitting.calib.profile_gains`.
+    response : :class:`~lucid.fitting.calib.PulseResponse` or None
+        The digitizer and dark noise for a pulsed source: the model becomes the recorded charge
+        over the run rather than the gain times the forward. None (default) is unchanged.
+    data_var : array ``(S, n_sensors)`` or None
+        The measured variance of ``data``, used in the Neyman weight in place of ``data`` itself
+        (see :func:`lucid.fitting.calib.neyman_variance`); :func:`pulsed_closure_data` returns it.
     seed : int
         Selects both key streams. Vary it to build an ensemble.
     predict, map_fn
@@ -152,14 +158,14 @@ def calibrate(sim, sources, params, data, theta0, *,
             raise ValueError(f'the supplied forward has {fwd.n_sources} sources but {len(sources)} '
                              f'were passed')
     jac = CalibrationJacobian(sim, sources, params, n_sensors, key0=jkey,
-                              map_fn=map_fn, predict=predict)
+                              map_fn=map_fn, predict=predict, response=response)
     if data.shape[0] != fwd.S:
         raise ValueError(f'data has {data.shape[0]} rows but the forward produces {fwd.S} '
                          f'({fwd.W} wavelengths x {fwd.n_sources} sources)')
 
     prob = CalibrationProblem(fwd, jac, params, data, q_floor, gauge=gauge,
                               n_forward_draws=n_forward_draws, jacobian_draws=jacobian_draws,
-                              forward_key0=fkey, frac=frac)
+                              forward_key0=fkey, frac=frac, response=response, data_var=data_var)
     th0 = jnp.asarray(theta0, dtype=jnp.float32)
     if tx is None:
         # The published path. `tx=None` must reach exactly this call: it is the configuration
@@ -205,6 +211,30 @@ def closure_data(forward, theta_true, gains=None, *, n_draws=8, key_base=5000):
     """
     g = jnp.ones(forward.NS) if gains is None else jnp.asarray(gains)
     return forward.average(jnp.asarray(theta_true, dtype=jnp.float32), key_base, g, n_draws)
+
+
+def pulsed_closure_data(forward, theta_true, response, gains=None, *, n_draws=8, key_base=5000,
+                        seed=0):
+    """Pseudo-data from a pulsed source, recorded through the digitizer: ``(data, data_var)``.
+
+    :func:`closure_data` at known parameters and gains sets each sensor's expected photoelectrons
+    per pulse (``response.pulse_scale`` per wavelength); ``response.n_pulses`` pulses are then
+    digitized with dark noise (:func:`lucid.simulation.digitizer.sample_pulse_charge_sums`).
+    ``data`` is each sensor's summed charge and ``data_var`` the variance of that sum from its
+    pulse-to-pulse spread, the Neyman variance :func:`calibrate` takes.
+    """
+    from lucid.simulation.digitizer import sample_pulse_charge_sums
+    mu = np.asarray(closure_data(forward, theta_true, gains, n_draws=n_draws, key_base=key_base),
+                    dtype=np.float64)
+    scale = np.asarray(response.pulse_scale, dtype=np.float64)
+    n = response.n_pulses
+    rng = np.random.default_rng(seed)
+    data, var = np.empty_like(mu), np.empty_like(mu)
+    for g in range(mu.shape[0]):                     # rows g = wl * n_sources + s
+        s, s2 = sample_pulse_charge_sums(scale[g // forward.n_sources] * mu[g], n,
+                                         response.model, rng, dark_mu=response.dark_mu)
+        data[g], var[g] = s, s2 - s * s / n
+    return jnp.asarray(data, dtype=jnp.float32), jnp.asarray(var, dtype=jnp.float32)
 
 
 def closure(sim, sources, params, theta_true, *, gains=None, perturbation=0.4,

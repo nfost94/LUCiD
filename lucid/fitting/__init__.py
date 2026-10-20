@@ -46,11 +46,11 @@ the per-PMT gains by Schur complement rather than profiling them, for that reaso
 """
 from lucid.fitting.params import CalibrationParams, FieldParams, LogParams
 from lucid.fitting.calib import (
-    CalibrationForward, CalibrationJacobian, CalibrationProblem,
+    CalibrationForward, CalibrationJacobian, CalibrationProblem, PulseResponse,
     profile_gains, neyman_residual,
 )
 from lucid.fitting.gn import gauss_newton
-from lucid.fitting.calibrate import calibrate, closure, closure_data, fit
+from lucid.fitting.calibrate import calibrate, closure, closure_data, fit, pulsed_closure_data
 from lucid.fitting.schur_gn import (
     SourceModel, sqrt_residual, make_constrained_schur, ridge_inverse,
     fit_charge_time, ChargeTimeModel,
@@ -80,8 +80,8 @@ __all__ = [
     # parameterisations
     'CalibrationParams', 'FieldParams', 'LogParams',
     # calibration: entry points, then the pieces
-    'calibrate', 'closure', 'closure_data', 'fit', 'build_calibration_problem',
-    'CalibrationForward', 'CalibrationJacobian', 'CalibrationProblem',
+    'calibrate', 'closure', 'closure_data', 'pulsed_closure_data', 'fit', 'build_calibration_problem',
+    'CalibrationForward', 'CalibrationJacobian', 'CalibrationProblem', 'PulseResponse',
     'profile_gains', 'neyman_residual',
     # the shared optimiser: the damped Gauss-Newton configuration, its optax pieces, the driver
     'gauss_newton',

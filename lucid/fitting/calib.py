@@ -38,7 +38,7 @@ the reference itself falls back to below 7 devices.
 import jax
 import jax.numpy as jnp
 
-__all__ = ['CalibrationForward', 'CalibrationJacobian', 'CalibrationProblem',
+__all__ = ['CalibrationForward', 'CalibrationJacobian', 'CalibrationProblem', 'PulseResponse',
            'profile_gains', 'neyman_residual']
 
 
@@ -235,7 +235,7 @@ class CalibrationJacobian:
     """
 
     def __init__(self, sim, sources, params, n_sensors, key0=9_000_000, map_fn=None,
-                 predict=None, laser_device=None):
+                 predict=None, laser_device=None, response=None):
         self.sim = sim
         self.sources = list(sources)
         self.params = params
@@ -245,6 +245,15 @@ class CalibrationJacobian:
         self.S = self.W * self.n_sources
         self.key0 = int(key0)
         self._per_source = None
+        self.response = response
+
+        def model(mu, lk, wl):
+            # The model charge the residual compares to the data (CalibrationProblem): the gain
+            # times the forward, through the pulse response when there is one. Inside sm, so the
+            # response is differentiated in the same fused expression as the weight.
+            if response is None:
+                return jnp.exp(lk) * mu
+            return response.charge(jnp.exp(lk) * mu, wl)
 
         if predict is not None:
             # Per-source route (see the module docstring). The fused expression is rebuilt around
@@ -253,7 +262,7 @@ class CalibrationJacobian:
                 def body(theta, wl, lk, key, q_cfg, q_floor):
                     def sm(th):
                         mu = predict(th, src, wl, jnp.ones(self.NS), key)
-                        return jnp.exp(lk) * mu / jnp.sqrt(jnp.clip(q_cfg, q_floor, None))
+                        return model(mu, lk, wl) / jnp.sqrt(jnp.clip(q_cfg, q_floor, None))
                     return jax.jacfwd(sm)(theta)
                 return jax.jit(body, static_argnums=(1,))
             self._per_source = [compile_one(src) for src in self.sources]
@@ -262,7 +271,7 @@ class CalibrationJacobian:
         def _jbody(theta, src, wl, lk, key, q_cfg, q_floor):
             def sm(th):
                 mu = sim(src, params.to_dp(th, wl, jnp.ones(self.NS)), key)[0]
-                return jnp.exp(lk) * mu / jnp.sqrt(jnp.clip(q_cfg, q_floor, None))
+                return model(mu, lk, wl) / jnp.sqrt(jnp.clip(q_cfg, q_floor, None))
             return jax.jacfwd(sm)(theta)
 
         self._jbody = _jbody
@@ -381,7 +390,11 @@ def profile_gains(model_charge, observed_sum, gauge='log', clip_min=1e-6):
                  unbiased, whereas taking its log first incurs a Jensen shift that is larger on
                  dim sensors. Not the published choice; adopting it would move published numbers.
     """
-    k = jnp.clip(observed_sum / model_charge, clip_min, None)
+    return _gauge_gains(jnp.clip(observed_sum / model_charge, clip_min, None), gauge)
+
+
+def _gauge_gains(k, gauge):
+    """Apply the gain gauge (see :func:`profile_gains`)."""
     if gauge == 'linear':
         return k / jnp.mean(k)
     if gauge == 'log':
@@ -389,21 +402,25 @@ def profile_gains(model_charge, observed_sum, gauge='log', clip_min=1e-6):
     raise ValueError(f"gauge must be 'log' or 'linear', got {gauge!r}")
 
 
-def neyman_variance(data, q_floor, frac=0.0):
+def neyman_variance(data, q_floor, frac=0.0, data_var=None):
     """The per-sensor variance in the Neyman weight: ``clip(Q, floor) + (frac·Q)²``.
 
     ``frac`` is a fractional (model/systematic) uncertainty. It leaves dim sensors at their
     Poisson weight and caps a bright sensor's pull at about ``1/frac²`` Poisson-equivalent counts,
     so a few hundred narrow-beam spot PMTs cannot dominate the fit. Still data-only. ``frac=0``
     returns ``clip(Q, floor)`` itself, so the published estimator is unchanged bit for bit.
+
+    ``data_var``, when given, replaces ``Q`` as the variance (still clipped at the floor): the
+    measured variance of each sensor's charge, e.g. its pulse-to-pulse spread for a pulsed source,
+    where digitized charge is not Poisson in photoelectrons. Still data-only.
     """
-    var = jnp.clip(data, q_floor, None)
+    var = jnp.clip(data if data_var is None else data_var, q_floor, None)
     if frac:
         var = var + (frac * data) ** 2
     return var
 
 
-def neyman_residual(model_charge, data, q_floor, frac=0.0):
+def neyman_residual(model_charge, data, q_floor, frac=0.0, data_var=None):
     """``r = (k·M − Q) / √(clip(Q, floor) + (frac·Q)²)`` — see :func:`neyman_variance`.
 
     The weight depends on the DATA only. That is the whole point: the forward model is a
@@ -411,7 +428,69 @@ def neyman_residual(model_charge, data, q_floor, frac=0.0):
     nonlinear in it and bias the gradient — permanently displacing the fixed point rather than
     merely adding noise. Neyman is the member of the χ² family whose weight is data-only.
     """
-    return (model_charge - data) / jnp.sqrt(neyman_variance(data, q_floor, frac))
+    return (model_charge - data) / jnp.sqrt(neyman_variance(data, q_floor, frac, data_var))
+
+
+class PulseResponse:
+    """The digitizer and dark noise in the calibration model, for a pulsed source.
+
+    A pulse gives a sensor ``x`` expected photoelectrons, for which the digitizer records a smooth
+    mean charge ``g(x)``: the threshold curve, SPE spectrum and charge precision averaged over
+    Poisson(``x``) photoelectrons (:func:`lucid.simulation.digitizer.pulse_charge_response`). Dark
+    pulses add a pedestal. Over ``n_pulses`` pulses the model charge is
+    ``n_pulses * (g(x) + pedestal)`` with ``x = pulse_scale[wl] * k * mu``: ``mu`` the forward's
+    charge, ``k`` the sensor's gain -- QE-like, so inside the response, as :func:`closure_data`
+    bakes it into the simulation -- and ``pulse_scale[wl]`` the expected photoelectrons per pulse
+    per unit of forward charge at wavelength ``wl`` (photons per pulse / the sources' intensity).
+
+    ``g`` is tabulated once, as the ratio ``g(x) / x`` on a log grid (between 0.83 and 1 for the
+    HK digitizer), and interpolated in JAX: the model stays differentiable, and exactly linear
+    below the grid. Above ``x_max`` the ratio is held. Not modelled: dead time and light later
+    than the integration window (see the digitizer's pulsed-source functions).
+    """
+
+    def __init__(self, model, n_pulses, pulse_scale, dark_mu=0.0, x_max=300.0, n_grid=600,
+                 rng=None):
+        import numpy as np
+        from lucid.simulation.digitizer import pulse_charge_response
+        grid = np.geomspace(1e-6, float(x_max), int(n_grid))
+        mean, _, _ = pulse_charge_response(model, np.concatenate([[0.0], grid]),
+                                           dark_mu=dark_mu, rng=rng)
+        self.model = model
+        self.n_pulses = int(n_pulses)
+        self.dark_mu = float(dark_mu)
+        self.pedestal = float(mean[0])
+        self.pulse_scale = jnp.asarray(pulse_scale, dtype=jnp.float32)
+        self._x_min = float(grid[0])
+        self._log_grid = jnp.asarray(np.log(grid), dtype=jnp.float32)
+        self._ratio = jnp.asarray((mean[1:] - mean[0]) / grid, dtype=jnp.float32)
+
+    def per_pulse(self, x):
+        """``g(x)``: the mean recorded prompt charge of one pulse at ``x`` expected photoelectrons."""
+        return x * jnp.interp(jnp.log(jnp.maximum(x, self._x_min)), self._log_grid, self._ratio)
+
+    def charge(self, mu, wl):
+        """Model charge over the run for forward charge ``mu`` (gain applied) at wavelength ``wl``."""
+        return self.n_pulses * (self.per_pulse(self.pulse_scale[wl] * mu) + self.pedestal)
+
+    def profile_gains(self, mu, observed_sum, wl, gauge='log', clip_min=1e-6, n_newton=8):
+        """Per-sensor gains that match the model's charge, summed over configurations, to the
+        data's -- :func:`profile_gains`' ``k = ΣQ/ΣM`` for a model nonlinear in ``k``.
+
+        ``g`` is monotone and nearly linear, so Newton's method from the linear solution converges
+        in a few steps; ``n_newton`` are taken, vectorized over sensors. ``wl`` is each row's
+        wavelength index, ``(S, 1)``. Then the same gauge.
+        """
+        x = self.pulse_scale[wl] * mu                              # (S, NS), per unit gain
+        target = observed_sum / self.n_pulses - mu.shape[0] * self.pedestal
+        k = jnp.clip(target / (x.sum(0) + 1e-12), clip_min, None)
+
+        def step(k, _):
+            f, df = jax.jvp(lambda kk: self.per_pulse(kk[None, :] * x).sum(0),
+                            (k,), (jnp.ones_like(k),))
+            return jnp.clip(k - (f - target) / (df + 1e-12), clip_min, None), None
+        k, _ = jax.lax.scan(step, k, None, length=n_newton)
+        return _gauge_gains(k, gauge)
 
 
 class CalibrationProblem:
@@ -436,7 +515,8 @@ class CalibrationProblem:
 
     def __init__(self, forward, jacobian, params, data, q_floor, *,
                  gauge='log', n_forward_draws=1, jacobian_draws=2,
-                 forward_key0=1000, forward_key_stride=13, frac=0.0):
+                 forward_key0=1000, forward_key_stride=13, frac=0.0,
+                 response=None, data_var=None):
         self.forward = forward
         self.jacobian = jacobian
         self.params = params
@@ -444,9 +524,19 @@ class CalibrationProblem:
         self.data_sum = data.sum(0)
         self.q_floor = float(q_floor)
         self.frac = float(frac)
+        # A PulseResponse (or None: the model is the gain times the forward) and the measured
+        # variance of the data (or None: Q itself; see neyman_variance). The response must be the
+        # one the Jacobian was built with.
+        self.response = response
+        self.data_var = None if data_var is None else jnp.asarray(data_var)
+        self._wl_rows = None if response is None else (
+            jnp.arange(data.shape[0]) // forward.n_sources)[:, None]
         # The Jacobian uses its data argument only as the weight's variance, √clip(·, floor). Handing
         # it the full Neyman variance (which is already >= floor) makes J weight exactly as r does.
-        self._q_jac = data if not self.frac else neyman_variance(data, self.q_floor, self.frac)
+        if self.data_var is None:
+            self._q_jac = data if not self.frac else neyman_variance(data, self.q_floor, self.frac)
+        else:
+            self._q_jac = neyman_variance(data, self.q_floor, self.frac, self.data_var)
         self.gauge = gauge
         self.n_forward_draws = int(n_forward_draws)
         self.jacobian_draws = int(jacobian_draws)
@@ -462,11 +552,19 @@ class CalibrationProblem:
         """Apply a step, preserving the reference's float32 iterate (see the class docstring)."""
         return theta + jnp.asarray(dtheta)
 
+    def _profiled_model(self, mu):
+        """-> ``(k, model charge)``: the profiled gains and the model the residual compares."""
+        if self.response is None:
+            k = profile_gains(mu.sum(0) + 1e-12, self.data_sum, gauge=self.gauge)
+            return k, k[None, :] * mu
+        k = self.response.profile_gains(mu, self.data_sum, self._wl_rows, gauge=self.gauge)
+        return k, self.response.charge(k[None, :] * mu, self._wl_rows)
+
     def grad_metric_loss(self, theta, step, refresh=True):
         ones = jnp.ones(self.data.shape[1])
         mu = self.forward.average(theta, self.forward_key(step), ones, self.n_forward_draws)
-        k = profile_gains(mu.sum(0) + 1e-12, self.data_sum, gauge=self.gauge)
-        r = neyman_residual(k[None, :] * mu, self.data, self.q_floor, self.frac)
+        k, model = self._profiled_model(mu)
+        r = neyman_residual(model, self.data, self.q_floor, self.frac, self.data_var)
 
         if refresh or self._J is None:
             self._J = self.jacobian(theta, jnp.log(k), step, self._q_jac, self.q_floor,
@@ -486,7 +584,7 @@ class CalibrationProblem:
         """
         ones = jnp.ones(self.data.shape[1])
         mu = self.forward.average(theta, self.forward_key(step), ones, self.n_forward_draws)
-        return profile_gains(mu.sum(0) + 1e-12, self.data_sum, gauge=self.gauge)
+        return self._profiled_model(mu)[0]
 
 
 def _group_by_structure(sources):
