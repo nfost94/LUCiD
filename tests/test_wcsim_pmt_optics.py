@@ -76,6 +76,24 @@ class TestModelZero:
 
 
 @pytest.mark.skipif(not WCSIM_MATERIALS.exists(), reason='WCSim source not on this machine')
+def test_qe_is_wcsims_head_on_detection_per_arriving_photon():
+    """HK_QE_wcsim.json = A(0) x WCSim's detection per absorbed photon, A(0) the head-on
+    absorbed fraction (front glass included), as the PMT table has it."""
+    import json
+    qe = json.loads((ROOT / 'config' / 'pmt' / 'HK_QE_wcsim.json').read_text())
+    wl, per_absorbed = gen.wcsim_detection_per_absorbed(
+        WCSIM_MATERIALS.parent,
+        Path('/user/nfost94/HKSim/Current_Analysis/Watchmal/run_macros/tuning_parameters.mac'))
+    npt.assert_allclose(qe['wavelengths_nm'], wl)
+    npt.assert_allclose(np.array(qe['qe_percent']) / 100,
+                        np.array(qe['_head_on_absorbed']) * per_absorbed, atol=1e-6)
+    i400 = qe['wavelengths_nm'].index(400.0)
+    head_on = tabulated_pmt_optical_outcome(jnp.asarray(1.0), jnp.asarray(400.0),
+                                            load_pmt_optical_table(TABLE)).absorptance
+    npt.assert_allclose(qe['_head_on_absorbed'][i400], head_on, atol=2e-4)
+
+
+@pytest.mark.skipif(not WCSIM_MATERIALS.exists(), reason='WCSim source not on this machine')
 def test_wcsim_indices_are_its_active_tables():
     energy, n_water, n_glass, n_cathode = gen.wcsim_indices(WCSIM_MATERIALS)
     assert energy.size == 60 and n_cathode == 1.0
