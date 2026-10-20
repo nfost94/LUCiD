@@ -115,7 +115,7 @@ def setup_event_simulator(
         overlap_st_width_frac=0.35,
         overlap_renorm=1.0,
         overlap_mode='interp',
-        sensor_shape='sphere',
+        sensor_shape=None,
         sk_pmt_lookup=None,
         sk_pmt_lookup_options=None,
         sensor_candidate_selection='all',
@@ -222,10 +222,14 @@ def setup_event_simulator(
         Soft-overlap lookup interpolation: ``'interp'`` (default, piecewise
         linear) or ``'cubic'`` (C2 natural spline — correct curvature for the
         autodiff Hessian wrt photon→sensor distance).
-    sensor_shape : {'sphere', 'sk20inch'}
-        PMT interception geometry. ``'sphere'`` preserves the legacy LUCiD
-        sensor model. ``'sk20inch'`` uses the SK-like sphere-plus-torus bulb,
-        the measured PMT axes, and the barrel inactive-band cut.
+    sensor_shape : {'sphere', 'sk20inch', 'hk50cm'} or None
+        PMT type. Default None takes the detector config's (``sensor_shape`` in
+        ``geometry_definitions``), else ``'sphere'``, the legacy LUCiD sensor
+        model; a value that disagrees with the config's raises (see
+        :func:`lucid.geometry.detector.resolve_sensor_shape`). ``'sk20inch'`` uses
+        the SK-like sphere-plus-torus bulb, the measured PMT axes, and the barrel
+        inactive-band cut. ``'hk50cm'`` is the HK 50 cm Box&Line, the cap of a
+        sphere (:mod:`lucid.propagation.hk_pmt_geometry`).
     sk_pmt_lookup : SKPMTCoverageLookup or None
         Optional prebuilt smooth SK PMT coverage table. This is mainly useful
         for tests and for sharing one table across simulator instances.
@@ -324,8 +328,8 @@ def setup_event_simulator(
         assignment, and uses a dedicated RNG substream so later QE and charge
         draws remain paired with a timing-disabled run. Default ``None``.
     pmt_detection_model : TabulatedPmtDetectionResponse, path-like, or None
-        Optional local-incidence detection response. For ``sensor_shape='sk20inch'``,
-        this multiplies the ordinary QE by a table evaluated at the cosine
+        Optional local-incidence detection response. For ``sensor_shape='sk20inch'``
+        or ``'hk50cm'``, this multiplies the ordinary QE by a table evaluated at the cosine
         between the incoming ray and the curved photocathode normal. The table
         is a relative response and may exceed one; stochastic hit modes clip
         only the final QE probability. ``None`` preserves the previous result.
@@ -382,7 +386,10 @@ def setup_event_simulator(
 
     # ---- Build containers from flat args -----------------------------------
     from lucid.geometry.detector_geometry import DetectorGeometry
+    from lucid.geometry.detector import resolve_sensor_shape
     from lucid.simulation.config import SimConfig
+
+    sensor_shape = resolve_sensor_shape(json_filename, sensor_shape)
 
     if sensor_acceptance_model not in ('sphere', 'cosine'):
         raise ValueError("sensor_acceptance_model must be 'sphere' or 'cosine'")
@@ -500,10 +507,10 @@ def setup_event_simulator(
         if _is_volume:
             raise ValueError(
                 "pmt_detection_model is only supported for surface detectors")
-        if sensor_shape != 'sk20inch':
+        if sensor_shape not in ('sk20inch', 'hk50cm'):
             raise ValueError(
-                "pmt_detection_model requires sensor_shape='sk20inch' so the "
-                "response is evaluated with a physical curved-surface normal")
+                "pmt_detection_model requires sensor_shape='sk20inch' or 'hk50cm' "
+                "so the response is evaluated with a physical curved-surface normal")
 
     # Optional learned position/incidence response. This is independent of the
     # tabulated local-angle response above; when both are supplied their

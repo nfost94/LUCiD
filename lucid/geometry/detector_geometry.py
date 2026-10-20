@@ -4,6 +4,7 @@ from typing import NamedTuple, Optional, Callable
 import jax.numpy as jnp
 
 from lucid.geometry import generate_detector, get_material_from_config
+from lucid.geometry.detector import resolve_sensor_shape
 from lucid.wavelength.medium import MediumProperties, make_medium
 from lucid.propagation.shared import create_propagator as create_shared_propagator
 
@@ -32,7 +33,7 @@ class DetectorGeometry(NamedTuple):
                     overlap_st_width_frac: float = 0.35,
                     overlap_renorm: float = 1.0,
                     overlap_mode: str = 'interp',
-                    sensor_shape: str = 'sphere',
+                    sensor_shape: Optional[str] = None,
                     sk_pmt_lookup=None,
                     sk_pmt_lookup_options=None,
                     sensor_candidate_selection: str = 'all',
@@ -74,11 +75,16 @@ class DetectorGeometry(NamedTuple):
             Soft-overlap renormalization constant C; default 1.0 = OFF.
         overlap_mode : str
             Soft-overlap lookup interpolation: 'interp' (default) or 'cubic'.
-        sensor_shape : {'sphere', 'sk20inch'}
-            PMT interception geometry; default 'sphere'. ``'sk20inch'`` uses
-            a sphere-plus-torus bulb with an inactive barrel band and requires
+        sensor_shape : {'sphere', 'sk20inch', 'hk50cm'} or None
+            PMT type; default None takes the config's (``sensor_shape`` in
+            ``geometry_definitions``), else 'sphere', the wall-mounted hemisphere
+            of the config's sensor radius (see
+            :func:`lucid.geometry.detector.resolve_sensor_shape`). ``'sk20inch'``
+            uses a sphere-plus-torus bulb with an inactive barrel band and requires
             measured ``pmt_directions`` and per-PMT ``surfaces`` labels
-            ('barrel', 'top', or 'bottom') on the loaded detector.
+            ('barrel', 'top', or 'bottom') on the loaded detector. ``'hk50cm'`` is
+            the HK Box&Line, the cap of a sphere
+            (:mod:`lucid.propagation.hk_pmt_geometry`).
         sk_pmt_lookup : SKPMTCoverageLookup or None
             Optional prebuilt Gaussian-bundle coverage table from
             :func:`lucid.propagation.sk_pmt_lookup.build_sk20inch_coverage_lookup`.
@@ -152,8 +158,7 @@ class DetectorGeometry(NamedTuple):
             and response parameters fitted per simulation are supplied
             separately through ``DetectorParams``.
         """
-        if sensor_shape not in ('sphere', 'sk20inch'):
-            raise ValueError("sensor_shape must be 'sphere' or 'sk20inch'")
+        sensor_shape = resolve_sensor_shape(json_filename, sensor_shape)
 
         # Normalize casing. 'string' = telescope / volume detector (IceCube-style).
         dt_key = detector_type.lower()
@@ -188,7 +193,7 @@ class DetectorGeometry(NamedTuple):
         if isinstance(detector, StringTelescope):
             if sensor_shape != 'sphere':
                 raise ValueError(
-                    "sensor_shape='sk20inch' is only available for measured "
+                    f"sensor_shape={sensor_shape!r} is only available for "
                     "surface-detector PMTs")
             from lucid.propagation.string.string_propagator import create_string_propagator
             propagator = create_string_propagator(
@@ -211,7 +216,6 @@ class DetectorGeometry(NamedTuple):
                 pmt_gap_recovery_hole_radius=pmt_gap_recovery_hole_radius,
                 sk_acrylic_optics=sk_acrylic_optics,
                 deposit_leg_bound=deposit_leg_bound,
-                expose_height=detector.expose_height,
                 **grid_params)
 
         return DetectorGeometry(

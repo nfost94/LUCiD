@@ -103,6 +103,30 @@ def load_detector_geom(file_path):
         raise ValueError(f"Unknown detector type: {detector_type}")
 
 
+# PMT types a surface detector can carry (``sensor_shape``):
+#   'sphere'   the wall-mounted hemisphere of the config's sensor_radius (the default)
+#   'sk20inch' the SK 20-inch sphere-plus-torus bulb (lucid.propagation.sk_pmt_geometry)
+#   'hk50cm'   the HK 50 cm Box&Line, a cap of a sphere (lucid.propagation.hk_pmt_geometry)
+SENSOR_SHAPES = ('sphere', 'sk20inch', 'hk50cm')
+
+
+def resolve_sensor_shape(file_path, sensor_shape=None):
+    """The PMT type for a detector config: ``sensor_shape`` given, else the config's, else 'sphere'.
+
+    A detector config names its PMT type as ``sensor_shape`` in ``geometry_definitions``; the type
+    then sets the PMT's geometry. A ``sensor_shape`` given here is for configs that name none (SK
+    runs pass ``'sk20inch'``); one that disagrees with the config's raises.
+    """
+    configured = load_detector_config(file_path).get('geometry_definitions', {}).get('sensor_shape')
+    if sensor_shape is not None and configured is not None and sensor_shape != configured:
+        raise ValueError(f"sensor_shape={sensor_shape!r} disagrees with {file_path!r}, whose PMT "
+                         f"type is {configured!r}")
+    shape = sensor_shape if sensor_shape is not None else (configured or 'sphere')
+    if shape not in SENSOR_SHAPES:
+        raise ValueError(f"sensor_shape must be one of {SENSOR_SHAPES}, got {shape!r}")
+    return shape
+
+
 def generate_detector(file_path):
     """Generate a detector from a JSON config file using the geometry registry.
 
@@ -119,13 +143,12 @@ def generate_detector(file_path):
 
     The npz path is resolved relative to the config-file directory.
 
-    An optional ``expose_height`` in ``geometry_definitions`` is the height each
-    sensor stands above the wall (default: its radius, a hemisphere).
+    The PMT type (``sensor_shape`` in ``geometry_definitions``) is not read here: it sets the
+    sensor's shape, not where sensors sit. See :func:`resolve_sensor_shape`.
     """
     config = load_detector_config(file_path)
     detector_type = config['detector_type']
     geom_def = config['geometry_definitions']
-    expose_height = geom_def.get('expose_height')
 
     cls = get_detector_class(detector_type)
 
@@ -150,16 +173,14 @@ def generate_detector(file_path):
             return cls.from_pmt_file(
                 npz_path,
                 snap_to_wall=geom_def.get('snap_to_wall', True),
-                expose_height=expose_height,
             )
         return cls(geom_def['radius'], geom_def['height'],
-                   geom_def['n_sensors'], geom_def['sensor_radius'], expose_height)
+                   geom_def['n_sensors'], geom_def['sensor_radius'])
     elif cls is Sphere:
-        return cls(geom_def['radius'], geom_def['n_sensors'], geom_def['sensor_radius'],
-                   expose_height)
+        return cls(geom_def['radius'], geom_def['n_sensors'], geom_def['sensor_radius'])
     elif cls is Box:
         return cls(geom_def['length'], geom_def['width'], geom_def['height'],
-                   geom_def['n_sensors'], geom_def['sensor_radius'], expose_height)
+                   geom_def['n_sensors'], geom_def['sensor_radius'])
     elif cls is StringTelescope:
         # Telescope geometry: per-DOM positions live in an NPZ next to the config.
         return cls.from_config(file_path)

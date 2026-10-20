@@ -20,6 +20,7 @@ from lucid.propagation.base import (
     find_closest_sensors,
 )
 from lucid.overlap import create_overlap_prob, cap_sphere
+from lucid.propagation import hk_pmt_geometry
 from lucid.propagation.sk_pmt_sensor import (
     compute_sk20inch_sensor_intersections,
 )
@@ -401,7 +402,7 @@ def create_propagator(detector, sensor_positions, sensor_radius,
                       pmt_gap_recovery_hole_radius=0.285,
                       sk_acrylic_optics=None,
                       deposit_leg_bound=False,
-                      expose_height=None, **grid_params):
+                      **grid_params):
     """Build a JIT-compiled photon propagator using detector methods.
 
     Parameters
@@ -412,10 +413,6 @@ def create_propagator(detector, sensor_positions, sensor_radius,
         Centres of the sensor apertures, on the wall.
     sensor_radius : float
         Aperture radius r.
-    expose_height : float or None
-        Height h the sensor stands above the wall. Each sensor is the cap of a sphere: aperture
-        radius r, height h, so a sphere of radius (h^2 + r^2) / (2h) centred (r^2 - h^2) / (2h) behind
-        the aperture. Default None = r, the hemisphere centred on the wall.
     temperature : float
         Soft-assignment temperature for overlap probability.
     overlap_st_width_frac : float
@@ -425,8 +422,12 @@ def create_propagator(detector, sensor_positions, sensor_radius,
         Soft-overlap renormalization constant C (default 1.0 = OFF).
     overlap_mode : str
         Soft-overlap lookup interpolation: 'interp' (default) or 'cubic'.
-    sensor_shape : {'sphere', 'sk20inch'}
-        Candidate-sensor geometry. ``'sphere'`` preserves the legacy model.
+    sensor_shape : {'sphere', 'sk20inch', 'hk50cm'}
+        Candidate-sensor geometry (the PMT type). ``'sphere'`` and ``'hk50cm'`` are each the cap of
+        a sphere standing on the wall, aperture radius r and height h: a sphere of radius
+        (h^2 + r^2) / (2h) centred (r^2 - h^2) / (2h) behind the aperture. ``'sphere'`` is the
+        hemisphere, h = r. ``'hk50cm'`` is the HK Box&Line, r = 0.254 m and h = 0.18 m
+        (:mod:`lucid.propagation.hk_pmt_geometry`); ``sensor_radius`` must be its aperture.
         ``'sk20inch'`` uses the measured PMT axes and SK-like sphere-plus-torus bulb shape.
     sk_pmt_lookup : SKPMTCoverageLookup or None
         Optional prebuilt smooth-coverage table, primarily for tests or reuse.
@@ -470,8 +471,12 @@ def create_propagator(detector, sensor_positions, sensor_radius,
     """
     sensor_positions = jnp.array(sensor_positions)
     num_sensors = len(sensor_positions)
-    if sensor_shape not in ('sphere', 'sk20inch'):
-        raise ValueError("sensor_shape must be 'sphere' or 'sk20inch'")
+    if sensor_shape not in ('sphere', 'sk20inch', 'hk50cm'):
+        raise ValueError("sensor_shape must be 'sphere', 'sk20inch' or 'hk50cm'")
+    if sensor_shape == 'hk50cm' and abs(float(sensor_radius) - hk_pmt_geometry.APERTURE_RADIUS) > 1e-6:
+        raise ValueError(
+            f"sensor_shape='hk50cm' has aperture radius {hk_pmt_geometry.APERTURE_RADIUS} m; the "
+            f"detector's sensor_radius is {float(sensor_radius)} m")
     if sensor_candidate_selection not in ('all', 'wall'):
         raise ValueError("sensor_candidate_selection must be 'all' or 'wall'")
     if sensor_candidate_selection == 'wall' and sensor_shape != 'sk20inch':
@@ -585,11 +590,13 @@ def create_propagator(detector, sensor_positions, sensor_radius,
     validate_sensor_map(assignments_geometric, inverted_sensor_map,
                         num_sensors, detector, max_candidates_per_ray)
 
-    # 4c. Sensor shape: the cap of a sphere standing on the wall (see `expose_height`). Each
-    # sensor's axis is the inward wall normal where it sits: a ray from the detector centre leaves
-    # the (convex) detector once, at the sensor, so intersect_ray and compute_normal give that normal
-    # for any geometry. At h == r the depth is exactly 0.0 and the centres are the positions as given.
-    expose_height = sensor_radius if expose_height is None else expose_height
+    # 4c. Sensor shape: the cap of a sphere standing on the wall, of height h (see `sensor_shape`).
+    # Each sensor's axis is the inward wall normal where it sits: a ray from the detector centre
+    # leaves the (convex) detector once, at the sensor, so intersect_ray and compute_normal give that
+    # normal for any geometry. At h == r the depth is exactly 0.0 and the centres are the positions
+    # as given. 'sk20inch' sets its own bulb (sk_pmt_geometry) and uses none of these.
+    expose_height = (hk_pmt_geometry.EXPOSE_HEIGHT if sensor_shape == 'hk50cm'
+                     else sensor_radius)
     sphere_radius, centre_depth = cap_sphere(sensor_radius, expose_height)
     centre = jnp.broadcast_to(jnp.asarray(detector.C, dtype=sensor_positions.dtype),
                               sensor_positions.shape)
@@ -602,7 +609,7 @@ def create_propagator(detector, sensor_positions, sensor_radius,
     # 5. Overlap probability (shared)
     # temperature=None → step function (hard assignment, non-differentiable)
     # temperature=float → Gaussian kernel with sigma = temperature * sensor_radius
-    if sensor_shape == 'sphere':
+    if sensor_shape in ('sphere', 'hk50cm'):
         if temperature is None:
             overlap_prob = create_overlap_prob(
                 None, sensor_radius, expose_height,

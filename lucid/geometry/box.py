@@ -12,7 +12,7 @@ from .registry import register_detector
 class Box(Detector):
     """Box (rectangular prism) detector geometry"""
     
-    def __init__(self, length, width, height, n_sensors, sensor_radius, expose_height=None):
+    def __init__(self, length, width, height, n_sensors, sensor_radius):
         """
         Initialize box detector.
 
@@ -28,10 +28,8 @@ class Box(Detector):
             Number of photosensors
         sensor_radius : float
             Radius of individual sensors
-        expose_height : float or None
-            Height each sensor stands above the wall; None = sensor_radius
         """
-        super().__init__(n_sensors, sensor_radius, expose_height)
+        super().__init__(n_sensors, sensor_radius)
         self.L = length
         self.W = width
         self.H = height

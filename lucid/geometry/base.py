@@ -11,7 +11,7 @@ from .utils import calculate_surface_normals, create_disc_mesh
 class Detector(ABC):
     """Base class for detector geometries"""
     
-    def __init__(self, n_sensors, sensor_radius, expose_height=None):
+    def __init__(self, n_sensors, sensor_radius):
         """
         Initialize common detector attributes.
 
@@ -21,14 +21,10 @@ class Detector(ABC):
             Number of photosensors
         sensor_radius : float
             Radius of individual sensors (the aperture radius)
-        expose_height : float or None
-            Height each sensor stands above the wall; None = sensor_radius, a hemisphere. See
-            shared.create_propagator.
         """
         self.C = np.array([0.0, 0.0, 0.0])  # Always centered at origin
         self.n_sensors = n_sensors
         self.S_radius = sensor_radius
-        self.expose_height = expose_height
         
         # These will be set by place_photosensors()
         self.all_points = None

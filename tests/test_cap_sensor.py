@@ -77,3 +77,42 @@ def test_hard_step_at_h_equal_r_is_the_free_spheres():
 def test_cap_height_outside_the_model_is_refused(h):
     with pytest.raises(ValueError):
         create_overlap_prob(None, R_AP, h)
+
+
+# PMT types. A detector config names its PMT type (`sensor_shape`), and the type sets the cap:
+# 'sphere' the hemisphere of the config's radius, 'hk50cm' the HK Box&Line.
+
+def test_hk50cm_is_wcsims_box_and_line():
+    from lucid.propagation import hk_pmt_geometry as hk
+    assert (hk.APERTURE_RADIUS, hk.EXPOSE_HEIGHT) == (0.254, 0.18)      # BoxandLine20inchHQE
+    assert (hk.SPHERE_RADIUS, hk.SPHERE_CENTRE_DEPTH) == cap_sphere(0.254, 0.18)
+
+
+def _geometry_config(tmp_path, name, **geometry_definitions):
+    import json
+    path = tmp_path / f'{name}.json'
+    path.write_text(json.dumps({'material': 'water', 'detector_type': 'cylinder',
+                                'geometry_definitions': geometry_definitions}))
+    return str(path)
+
+
+def test_the_detector_config_names_the_pmt_type(tmp_path):
+    from lucid.geometry.detector import resolve_sensor_shape
+    named = _geometry_config(tmp_path, 'named', sensor_shape='hk50cm')
+    assert resolve_sensor_shape(named) == 'hk50cm'
+    assert resolve_sensor_shape(named, 'hk50cm') == 'hk50cm'
+    with pytest.raises(ValueError, match='disagrees'):
+        resolve_sensor_shape(named, 'sphere')
+    unnamed = _geometry_config(tmp_path, 'unnamed')
+    assert resolve_sensor_shape(unnamed) == 'sphere'
+    assert resolve_sensor_shape(unnamed, 'sk20inch') == 'sk20inch'   # SK runs pass their type
+    with pytest.raises(ValueError, match='one of'):
+        resolve_sensor_shape(_geometry_config(tmp_path, 'unknown', sensor_shape='hk20inch'))
+
+
+def test_hk50cm_refuses_a_detector_of_another_aperture():
+    from lucid.geometry.cylinder import Cylinder
+    from lucid.propagation.shared import create_propagator
+    det = Cylinder(5.0, 10.0, 200, 0.1)
+    with pytest.raises(ValueError, match='aperture radius'):
+        create_propagator(det, det.all_points, 0.1, temperature=None, sensor_shape='hk50cm')
