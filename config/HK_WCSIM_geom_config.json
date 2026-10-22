@@ -1,0 +1,9 @@
+{
+  "material": "water",
+  "detector_type": "cylinder",
+  "_comment_pmt": "sensor_shape hk50cm = the HK 50 cm Box&Line, WCSim's BoxandLine20inchHQE: a cap of aperture 0.254 m (the npz's sensor_radius) and height 0.18 m, the cap of a 0.269211 m sphere centred 0.089211 m behind the wall, as WCSim builds it (lucid/propagation/hk_pmt_geometry.py).",
+  "geometry_definitions": {
+    "npz_file_path": "hk_geometry.npz",
+    "sensor_shape": "hk50cm"
+  }
+}
