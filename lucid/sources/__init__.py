@@ -22,6 +22,11 @@ __all__ = [
     "measured_profile_source",
     "fitted_profile_source",
     "sample_measured_profile_rays",
+    "DifferentiableProfileSource",
+    "differentiable_profile_source",
+    "sample_differentiable_profile_rays",
+    "profile_intensity",
+    "PROFILE_FORMS",
     "ShotgunSource",
     "shotgun_source",
     "stack_shotgun_sources",
@@ -46,6 +51,11 @@ from lucid.sources.calibration_sources import (
     measured_profile_source,
     fitted_profile_source,
     sample_measured_profile_rays,
+    DifferentiableProfileSource,
+    differentiable_profile_source,
+    sample_differentiable_profile_rays,
+    profile_intensity,
+    PROFILE_FORMS,
 )
 from lucid.sources.shotgun_source import (
     ShotgunSource,

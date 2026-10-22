@@ -430,7 +430,7 @@ def laser_source(position, intensity=1_000_000, direction=None, fiber_NA=0.22,
 
 
 # ---------------------------------------------------------------------------
-# Measured-profile source, ported from HKUKLI/deprecated/measured_profile_source_job.py.
+# Measured-profile sources: a goniometer scan, or a fitted composite, as inverse-CDF tables.
 # ---------------------------------------------------------------------------
 
 def _axis_angle_from_x_axis(direction):
@@ -485,8 +485,7 @@ class MeasuredProfileSource(NamedTuple):
     """Calibration source drawn from a real goniometer profile scan -- callable JAX pytree.
 
     Usage: ``source(n_photons, key)`` or ``source(n_photons, key, n_water)``.
-    Built via `measured_profile_source`; see HKUKLI/deprecated/injector_profile_comparison.ipynb
-    and HKUKLI/deprecated/measured_profile_source_job.py for derivation/validation.
+    Built via `measured_profile_source` (a scan) or `fitted_profile_source` (a fitted composite).
     """
     position: jnp.ndarray
     rotation_axis: jnp.ndarray
@@ -533,9 +532,7 @@ def fitted_profile_source(position, direction, params, alpha_max,
                            intensity=1_000_000, wavelength=None):
     """Build a MeasuredProfileSource from an already-fitted composite(w,p,a0,s) model
     instead of a measured grid -- phi-uniform, so is_collimator=False (the pole-embedding
-    convention alpha already assumes). params/alpha_max come from
-    HKUKLI/deprecated/injector_profile_comparison.ipynb's `fit_common_profile` (PyROOT/Minuit2 --
-    run offline, not here).
+    convention alpha already assumes).
     """
     fine_u, marginal_cdf, fine_phi, cond = build_fit_cdf(params, alpha_max)
 
@@ -551,6 +548,128 @@ def fitted_profile_source(position, direction, params, alpha_max,
         fine_phi=jnp.asarray(fine_phi, dtype=jnp.float32),
         cond=jnp.asarray(cond, dtype=jnp.float32),
         is_collimator=jnp.asarray(False),
+        intensity=jnp.asarray(float(intensity), dtype=jnp.float32),
+        wavelength=wl,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Differentiable profile source: the profile lives in the ray weights, not the directions.
+# ---------------------------------------------------------------------------
+# Deposits are linear in the ray weights, so d(charge)/d(profile params) needs no gradient through
+# the ray geometry. The sampled cap must contain all the emitted light: anything beyond alpha_cut
+# is dropped, and a needlessly wide cap spends rays on dim angles.
+
+PROFILE_FORMS = ('composite', 'super_gaussian', 'sk_beam')   # index = DifferentiableProfileSource.profile_id
+
+
+def _power(x, k):
+    """x**k for x >= 0 with a finite derivative in k at x = 0 (0**k with k traced is NaN-prone)."""
+    return jnp.exp(k * jnp.log(jnp.maximum(x, 1e-30)))
+
+
+def _profile_composite(alpha_deg, params):
+    # Super-Gaussian core x Fermi edge: exp(-(a/w)^(2p)) / (1 + exp((a - a0)/s)); params (w, p, a0, s).
+    w, p, a0, s = params[0], params[1], params[2], params[3]
+    return jnp.exp(-_power(alpha_deg / w, 2 * p)) * jax.nn.sigmoid((a0 - alpha_deg) / s)
+
+
+def _profile_super_gaussian(alpha_deg, params):
+    # exp(-(a/w)^(2p)); params (w, p, -, -).
+    w, p = params[0], params[1]
+    return jnp.exp(-_power(alpha_deg / w, 2 * p))
+
+
+def _profile_sk_beam(alpha_deg, params):
+    # SKDetSim RNGAUSYOO beam (gaussian_beam_theta): tan^2(alpha) = |sigma Z| / 3610 with
+    # sigma = sigbm * pi/180, giving I ~ sec^3(alpha) exp(-tan^4(alpha) / (2 (sigma/3610)^2));
+    # params (sigbm, -, -, -). SK-IV injector 1 uses sigbm = 3300.
+    t = jnp.radians(alpha_deg)
+    s = jnp.radians(params[0]) / 3610.0
+    return jnp.exp(-jnp.tan(t) ** 4 / (2 * s * s)) / jnp.cos(t) ** 3
+
+
+def profile_intensity(alpha_deg, params, profile_id):
+    """Relative intensity per solid angle at off-axis angle ``alpha_deg`` for profile ``profile_id``
+    (an index into PROFILE_FORMS). ``params`` is a length-4 array, padded for the shorter forms."""
+    return jax.lax.switch(profile_id, (_profile_composite, _profile_super_gaussian,
+                                       _profile_sk_beam), alpha_deg, params)
+
+
+@partial(jax.jit, static_argnums=(7,))
+def sample_differentiable_profile_rays(position, rotation_axis, rotation_angle, params,
+                                       profile_id, alpha_cut_deg, intensity, n_photons, key):
+    key_u, key_phi = random.split(key)
+    # Stratified in u = cos(alpha): one uniform draw per equal slice of the cap.
+    cos_cut = jnp.cos(jnp.radians(alpha_cut_deg))
+    q = (jnp.arange(n_photons) + random.uniform(key_u, (n_photons,))) / n_photons
+    u = cos_cut + (1.0 - cos_cut) * q
+    phi = random.uniform(key_phi, (n_photons,)) * 2.0 * jnp.pi
+    polar = jnp.arccos(jnp.clip(u, -1.0, 1.0))
+
+    # Injector axis along local +x, rotated onto the direction (as the measured diffuser source).
+    d_native = jnp.stack([jnp.cos(polar), jnp.sin(polar) * jnp.cos(phi),
+                          jnp.sin(polar) * jnp.sin(phi)], axis=-1)
+    ray_vectors = jax.vmap(lambda v: jax_rotate_vector(v, rotation_axis, rotation_angle))(d_native)
+    ray_origins = jnp.tile(position[None, :], (n_photons, 1))
+
+    # The directions are a uniform sample of the cap, so weighting each by the profile reproduces
+    # it; normalising over the batch makes the weights sum to `intensity` exactly.
+    rel = profile_intensity(jnp.degrees(polar), params, profile_id)
+    photon_weights = intensity * rel / jnp.sum(rel)
+    return ray_vectors, ray_origins, photon_weights
+
+
+class DifferentiableProfileSource(NamedTuple):
+    """Calibration source whose angular profile is differentiable in its parameters.
+
+    Usage: ``source(n_photons, key)``. Directions are uniform over the cap ``alpha <= alpha_cut``;
+    the profile (``PROFILE_FORMS[profile_id]`` at ``params``) lives in the ray weights. Gradients
+    flow to ``params`` (and ``intensity``), not to the directions. Built via
+    :func:`differentiable_profile_source`.
+    """
+    position: jnp.ndarray
+    rotation_axis: jnp.ndarray
+    rotation_angle: jnp.ndarray
+    params: jnp.ndarray          # (4,), padded for the shorter forms
+    profile_id: jnp.ndarray      # int, index into PROFILE_FORMS
+    alpha_cut: jnp.ndarray       # deg, half-angle of the sampled cap
+    intensity: jnp.ndarray = jnp.float32(1.0)
+    wavelength: object = None
+
+    def __call__(self, n_photons, key, n_water=1.33):
+        return sample_differentiable_profile_rays(
+            self.position, self.rotation_axis, self.rotation_angle, self.params,
+            self.profile_id, self.alpha_cut, self.intensity, n_photons, key,
+        )
+
+
+def differentiable_profile_source(position, direction, params, alpha_cut, profile='composite',
+                                  intensity=1_000_000, wavelength=None):
+    """Build a :class:`DifferentiableProfileSource`.
+
+    Parameters
+    ----------
+    params : sequence
+        Profile parameters, angles in degrees: ``composite`` (w, p, a0, s);
+        ``super_gaussian`` (w, p); ``sk_beam`` (sigbm,).
+    alpha_cut : float
+        Half-angle (deg) of the sampled cap; must contain all the emitted light.
+    profile : str
+        One of PROFILE_FORMS.
+    """
+    if profile not in PROFILE_FORMS:
+        raise ValueError(f'profile must be one of {PROFILE_FORMS}, got {profile!r}')
+    p = jnp.zeros(4, dtype=jnp.float32).at[:len(params)].set(jnp.asarray(params, dtype=jnp.float32))
+    rotation_axis, rotation_angle = _axis_angle_from_x_axis(jnp.asarray(direction, dtype=jnp.float32))
+    wl = jnp.asarray(float(wavelength), dtype=jnp.float32) if wavelength is not None else None
+    return DifferentiableProfileSource(
+        position=jnp.asarray(position, dtype=jnp.float32),
+        rotation_axis=rotation_axis,
+        rotation_angle=rotation_angle,
+        params=p,
+        profile_id=jnp.asarray(PROFILE_FORMS.index(profile), dtype=jnp.int32),
+        alpha_cut=jnp.asarray(float(alpha_cut), dtype=jnp.float32),
         intensity=jnp.asarray(float(intensity), dtype=jnp.float32),
         wavelength=wl,
     )
