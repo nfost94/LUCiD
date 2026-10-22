@@ -1,10 +1,10 @@
-"""HK WAND optics at the laser wavelengths, read from LUCiD's HK_WAND physics config.
+"""HK optics at the laser wavelengths, read from LUCiD's HK_WCSIM physics config.
 
-The WAND production's detector description (config/HK_WAND_physics_config.json) is aligned
-with the WCSim HK production: water from materials/water_wcsim.json (WCSim's tables x abwff
+The HK_WCSIM detector description (config/HK_WCSIM_physics_config.json) is aligned with the
+WCSim HK production: water from materials/water_wcsim.json (WCSim's tables x abwff
 1.30 / rayff 0.75, no Mie), QE from pmt/HK_QE_wcsim.json (WCSim's net detection per photon
 reaching the PMT), glass/cathode reflectivity 0.32 and blacksheet 0.1125. Everything here is
-evaluated from those files, so a calibration fit's truth and the production cannot drift apart.
+evaluated from those files, so a calibration fit's truth and the WCSim-aligned config cannot drift apart.
 
 WCSim's blacksheet reflectivity is 0.1125 up to 395 nm but 0.145 / 0.1375 at 440 / 500 nm;
 the config, like the multi-wavelength fit (CalibrationParams), uses one value at every
@@ -20,7 +20,7 @@ from lucid.simulation.trigger import trigger_from_block
 from lucid.wavelength.medium import load_qe_curve, make_medium
 
 _CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config')
-PHYSICS_CONFIG = os.path.join(_CONFIG_DIR, 'HK_WAND_physics_config.json')
+PHYSICS_CONFIG = os.path.join(_CONFIG_DIR, 'HK_WCSIM_physics_config.json')
 with open(PHYSICS_CONFIG) as _f:
     _PHYS = json.load(_f)
 

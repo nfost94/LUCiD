@@ -6,7 +6,7 @@ with a central finite difference of the forward taken on the same keys. Both are
 N_KEYS keys, so each estimates the derivative of the EXPECTED charge; per key they need not agree
 (the simulator samples discrete branches), but their means must, within the key-to-key scatter.
 
-Run for two setups with the same truth: 'new' (WAND cap PMTs + leg bound, as the closure job now
+Run for two setups with the same truth: 'new' (HK_WCSIM cap PMTs + leg bound, as the closure job now
 runs) and 'old' (HK hemisphere PMTs, no leg bound, as the October closures ran). Absorption and
 QE are controls. Sums are over the PMTs inside / outside each diffuser's 40 deg cone.
 """
@@ -25,7 +25,7 @@ def main():
     from hk_wcsim_params import REFLECTION, WCSIM_BY_WAVELENGTH
 
     # ---- configuration (edit here) ----
-    SETUPS = {'cap, no leg bound': ('../config/HK_WAND_geom_config.json', False),
+    SETUPS = {'cap, no leg bound': ('../config/HK_WCSIM_geom_config.json', False),
               'hemisphere, leg bound': ('../config/HK_geom_config.json', True)}
     WL = 395
     INJ_IDX = ['5', '28']                     # a barrel and the top diffuser
