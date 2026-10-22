@@ -333,9 +333,7 @@ def make_medium(material: str = "water",
 
         # Eq.(15) power-law fit (blue) spliced onto the Pope&Fry data (red) at 464 nm.
         # The two pieces differ by ~12% at the seam, so a hard switch leaves a kink; blend
-        # them with a C2 smootherstep over a +-12 nm window. (The blend WEIGHT is C2; the
-        # result inherits the piecewise-linear knot kinks of the interpolated Pope&Fry
-        # table itself — tiny, but not strictly C2.)
+        # them with a C2 smootherstep over a +-12 nm window.
         C_powerlaw = P0 * P2 * (wl / 500.0) ** P3
         C_popefry = jnp.interp(wl, pf_wl, pf_abs)
         _bw = 12.0

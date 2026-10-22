@@ -609,9 +609,9 @@ def tabulated_lambertian_reflection(
     WCSim's blacksheet (OpWaterBSSurface: groundfrontpainted, EFFICIENCY 0) reflects with a
     probability set by wavelength alone, and in a Lambertian direction about the wall normal
     whatever the incoming direction (G4LambertianRand). Here that probability is flat:
-    ``wall_scale`` is the wall reflectance itself. The PMT is the tabulated models': ``sensor_scale``
-    times the table reflectance, specular, with detection applied separately from the table's
-    absorptance (``pmt_detection``). Its s/p weighting, when polarisation is tracked, follows the
+    ``wall_scale`` is the wall reflectance itself. The PMT reflects as in the tabulated models:
+    ``sensor_scale`` times the table reflectance, specular, with detection applied separately from
+    the table's absorptance (``pmt_detection``). Its s/p weighting, when polarisation is tracked, follows the
     tabulated models' SK-IV column convention.
     """
     normal_refl = sg(normal)

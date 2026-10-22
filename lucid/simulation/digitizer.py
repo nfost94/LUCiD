@@ -405,8 +405,8 @@ def apply_discriminator(pe_reco: np.ndarray, model: dict, rng: np.random.Generat
     fires with probability :func:`discriminator_efficiency`.
 
     A discriminator fires on the analogue pulse, so this runs after the SPE
-    spectrum has been sampled -- see the module docstring for why the ordering
-    is load-bearing.
+    spectrum has been sampled -- see the module docstring for why the order
+    matters.
     """
     pe_reco = np.asarray(pe_reco)
     if model.get("threshold_curve") is None:

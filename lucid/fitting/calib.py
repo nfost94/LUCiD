@@ -255,7 +255,7 @@ class CalibrationJacobian:
         self.response = response
 
         def model(mu, lk, wl):
-            # The model charge the residual compares to the data (CalibrationProblem): the gain
+            # The model charge compared with the data (CalibrationProblem): the gain
             # times the forward, through the pulse response when there is one. Inside sm, so the
             # response is differentiated in the same fused expression as the weight.
             if response is None:
@@ -415,7 +415,7 @@ def jackknife_profile(draws, observed_sum, gauge='log', response=None, wl=None, 
     """Profiled gains and model charge from ``n >= 2`` forward draws, with their 1/n bias removed.
 
     Profiling the gains, ``k = ΣQ / ΣM``, puts the forward's Monte-Carlo charge in a denominator,
-    so the model the residual compares, ``k·M``, is a ratio of noisy charges. Its expectation sits
+    so the model charge compared with the data, ``k·M``, is a ratio of noisy charges. Its expectation sits
     ``∝ var(M) ∝ 1/n`` off its value at the mean model (Jensen), most on dim sensors: the bias
     ``tests/test_fitting_estimator_unbiased.py`` measures. The jackknife cancels that term from the
     draws already in hand. For any estimate ``f`` made from all ``n`` draws and ``f_(-i)`` made
@@ -456,7 +456,8 @@ def neyman_variance(data, q_floor, data_var=None):
 
     ``data_var``, when given, replaces ``Q`` as the variance (still clipped at the floor): the
     measured variance of each sensor's charge, e.g. its pulse-to-pulse spread for a pulsed source,
-    where digitized charge is not Poisson in photoelectrons. Still data-only.
+    where digitized charge is not Poisson in photoelectrons. The weight still depends only on
+    the data, not the model.
     """
     return jnp.clip(data if data_var is None else data_var, q_floor, None)
 
@@ -520,7 +521,7 @@ class PulseResponse:
 
         ``g`` is monotone and nearly linear, so Newton's method from the linear solution converges
         in a few steps; ``n_newton`` are taken, vectorized over sensors. ``wl`` is each row's
-        wavelength index, ``(S, 1)``. Then the same gauge.
+        wavelength index, ``(S, 1)``. The gauge is then applied as in :func:`profile_gains`.
         """
         x = self.pulse_scale[wl] * mu                              # (S, NS), per unit gain
         target = observed_sum / self.n_pulses - mu.shape[0] * self.pedestal
@@ -604,7 +605,7 @@ class CalibrationProblem:
         return jackknife_profile(draws, self.data_sum, self.gauge, self.response, self._wl_rows)
 
     def _profiled_model(self, mu):
-        """-> ``(k, model charge)``: the profiled gains and the model the residual compares."""
+        """-> ``(k, model charge)``: the profiled gains and the model charge compared with the data."""
         if self.response is None:
             k = profile_gains(mu.sum(0) + 1e-12, self.data_sum, gauge=self.gauge)
             return k, k[None, :] * mu

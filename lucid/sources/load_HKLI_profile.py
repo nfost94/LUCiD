@@ -1,8 +1,8 @@
-"""Load HKUKLI goniometer calibration-source scans and build their 2D
+"""Load the Warwick goniometer scans of the HK calibration injectors and build their 2D
 inverse-CDF sampling tables.
 
-Ported from HKUKLI/deprecated/injector_profile_comparison.ipynb / HKUKLI/deprecated/measured_profile_source_job.py.
-Pure numpy, one-time setup -- consumed by lucid.sources.calibration_sources.measured_profile_source.
+Pure numpy, one-time setup, used by measured_profile_source and fitted_profile_source
+(lucid.sources.calibration_sources).
 """
 
 import numpy as np
@@ -90,8 +90,7 @@ def build_2d_cdf_u(u_vals, phi_vals, grid_u, n_fine_u=400, n_fine_phi=200, phi_r
 
 
 def composite_profile(alpha_deg, w, p, a0, s):
-    # Diffuse super-Gaussian core (w, p) times a Fermi-style soft cutoff edge at a0
-    # (softness s) -- see HKUKLI/deprecated/injector_profile_comparison.ipynb cells 8/16 for the fit.
+    # Diffuse super-Gaussian core (w, p) times a Fermi-style soft cutoff edge at a0 (softness s).
     core = np.exp(-(np.asarray(alpha_deg) / max(w, 1e-6)) ** (2 * p))
     edge = 1.0 / (1.0 + np.exp((np.asarray(alpha_deg) - a0) / max(s, 1e-6)))
     return core * edge

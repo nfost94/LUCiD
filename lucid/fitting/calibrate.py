@@ -111,7 +111,8 @@ def calibrate(sim, sources, params, data, theta0, *,
         Gain gauge; see :func:`lucid.fitting.calib.profile_gains`.
     response : :class:`~lucid.fitting.calib.PulseResponse` or None
         The digitizer and dark noise for a pulsed source: the model becomes the recorded charge
-        over the run rather than the gain times the forward. None (default) is unchanged.
+        over the run rather than the gain times the forward. None (default): the gain times the
+        forward.
     data_var : array ``(S, n_sensors)`` or None
         The measured variance of ``data``, used in the Neyman weight in place of ``data`` itself
         (see :func:`lucid.fitting.calib.neyman_variance`); :func:`pulsed_closure_data` returns it.
