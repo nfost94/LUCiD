@@ -30,7 +30,8 @@ SQRT12 = float(np.sqrt(12.0))
 
 
 def crb(sources, theta_true, n_sensors, *, lk_true=None, weights=None,
-        nphot=None, nb_h=3, honesty=SQRT12, ridge_rel=1e-9, frac=0.0):
+        nphot=None, nb_h=3, honesty=SQRT12, ridge_rel=1e-9, frac=0.0,
+        marginalize_k=True):
     """Cramér-Rao bound on the global parameters at ``theta_true``.
 
     Parameters
@@ -52,6 +53,10 @@ def crb(sources, theta_true, n_sensors, *, lk_true=None, weights=None,
         Fractional uncertainty matching ``fit(frac=...)``: the variance becomes ``μ + (frac·μ)²``,
         so each sensor's Poisson information is scaled by ``1/(1 + frac²·μ)``. 0 (default) is
         unchanged.
+    marginalize_k : bool
+        Marginalise a free per-PMT multiplicative factor when True (the multi-source
+        calibration default). Set False when those factors are fixed, as required for a
+        one-source spatial-pattern calibration.
 
     Returns
     -------
@@ -83,8 +88,12 @@ def crb(sources, theta_true, n_sensors, *, lk_true=None, weights=None,
         Htk += (Ji * w[:, None]).T * Jk[None, :]
         Hkk += w * (Jk * Jk)
 
-    Minv = make_constrained_schur(Hkk)
-    F = 4.0 * (Htt - Htk @ Minv(Htk.T))
+    if marginalize_k:
+        Minv = make_constrained_schur(Hkk)
+        Hglobal = Htt - Htk @ Minv(Htk.T)
+    else:
+        Hglobal = Htt
+    F = 4.0 * Hglobal
     cov_raw = np.linalg.inv(F + ridge_rel * np.median(np.diag(F)) * np.eye(n_params))
     cov = cov_raw * (honesty ** 2)
     sigma = np.sqrt(np.clip(np.diag(cov), 0, None))

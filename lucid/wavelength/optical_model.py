@@ -1,10 +1,11 @@
 """Per-photon optical model — the single, testable λ → optical-property seam.
 
 ``evaluate_optical_model`` maps per-photon wavelengths to the per-photon optical
-lengths (Rayleigh scatter, Mie scatter, absorption) and QE weight that the photon
-transport step consumes. It is a **pure** function of ``(DetectorParams, wavelengths,
-MediumProperties)`` — all λ-sampling lives upstream (the source / simulator), so the
-model only ever *evaluates* at the wavelengths it is handed.
+lengths (Rayleigh scatter, Mie scatter, absorption), QE weight, and group velocity
+that the photon transport step consumes. It is a **pure** function of
+``(DetectorParams, wavelengths, MediumProperties)`` — all λ-sampling lives upstream
+(the source / simulator), so the model only ever *evaluates* at the wavelengths it
+is handed.
 
 Two regimes, one return type (:class:`OpticalArrays`):
 
@@ -12,8 +13,8 @@ Two regimes, one return type (:class:`OpticalArrays`):
   ``DetectorParams`` optical scalars to all photons. QE weight is ``None`` (the scalar
   QE enters in ``make_hits``).
 - ``wavelengths`` an ``(n,)`` array — wavelength mode: evaluate the medium reference
-  curves at each photon's λ (``length = 1 / coeff(λ)``) and, if a ``qe_fn`` is given,
-  the per-photon QE weight ``qe_fn(λ)``.
+  curves at each photon's λ (``length = 1 / coeff(λ)``), the material group velocity,
+  and, if a ``qe_fn`` is given, the per-photon QE weight ``qe_fn(λ)``.
 
 The design target is one decomposition
 ``prop(λ) = reference(λ) · deviation(λ; DetectorParams)`` where the reference is fixed
@@ -25,6 +26,8 @@ reproduces the medium reference exactly).
 from typing import NamedTuple, Optional
 
 import jax.numpy as jnp
+
+from lucid.wavelength.medium import group_velocity_m_per_ns
 
 
 # Control wavelengths (nm) at which the fittable λ-deviation curves are anchored.
@@ -55,14 +58,14 @@ class OpticalArrays(NamedTuple):
     mie_len : jnp.ndarray       (n,) Mie scattering length, m
     abs_len : jnp.ndarray       (n,) absorption length, m
     qe : jnp.ndarray or None    (n,) per-photon QE weight, or None in scalar mode
-    speed : jnp.ndarray or None (n,) propagation speed c / n_g(λ), m/ns, in wavelength mode when
-                                the medium has a group-index curve; None = the medium's single speed
+    propagation_speed : jnp.ndarray or None
+        (n,) group velocity in m/ns, or None in scalar mode
     """
     scatter_len: jnp.ndarray
     mie_len: jnp.ndarray
     abs_len: jnp.ndarray
     qe: Optional[jnp.ndarray]
-    speed: Optional[jnp.ndarray] = None
+    propagation_speed: Optional[jnp.ndarray]
 
 
 def evaluate_optical_model(detector_params, wavelengths, medium, n_photons,
@@ -115,6 +118,7 @@ def evaluate_optical_model(detector_params, wavelengths, medium, n_photons,
             mie_len=jnp.full(n_photons, sp.mie_scatter_length),
             abs_len=jnp.full(n_photons, ab.absorption_length),
             qe=None,
+            propagation_speed=None,
         )
 
     # Wavelength mode: clamp λ into the medium grid, then length = 1 / coeff(λ),
@@ -133,16 +137,10 @@ def evaluate_optical_model(detector_params, wavelengths, medium, n_photons,
     if qe_fn is not None:
         qe = qe_fn(wl) * _deviation(wl, control_lambda, rp.qe_dev)
 
-    # Group velocity c / n_g(λ), c = the medium's speed × its scalar index (the vacuum speed).
-    speed = None
-    if medium.group_index_curve is not None:
-        c_vacuum = medium.speed_of_light * medium.refractive_index
-        speed = c_vacuum / jnp.interp(wl, medium.wavelength_grid, medium.group_index_curve)
-
     return OpticalArrays(
         scatter_len=(1.0 / (sc + 1e-30)) / dev_r,
         mie_len=(1.0 / (asym + 1e-30)) / dev_m,
         abs_len=(1.0 / (ac + 1e-30)) / dev_a,
         qe=qe,
-        speed=speed,
+        propagation_speed=group_velocity_m_per_ns(wl, medium),
     )
