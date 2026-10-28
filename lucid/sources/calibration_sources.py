@@ -5,6 +5,7 @@ Moved from lucid/generate.py and lucid/detector_params.py during Phase 2.2 refac
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import random
 from typing import NamedTuple
 from functools import partial
@@ -557,10 +558,13 @@ def fitted_profile_source(position, direction, params, alpha_max,
 # Differentiable profile source: the profile lives in the ray weights, not the directions.
 # ---------------------------------------------------------------------------
 # Deposits are linear in the ray weights, so d(charge)/d(profile params) needs no gradient through
-# the ray geometry. The sampled cap must contain all the emitted light: anything beyond alpha_cut
-# is dropped, and a needlessly wide cap spends rays on dim angles.
+# the ray geometry. The directions are drawn from a proposal: the profile at the parameters the source
+# was built with, frozen. The weights carry the ratio of the current profile to that proposal, so near
+# the proposal every ray counts about equally, and fitting the parameters never moves a ray. The cap must
+# contain all the emitted light: anything beyond alpha_cut is dropped.
 
-PROFILE_FORMS = ('composite', 'super_gaussian', 'sk_beam')   # index = DifferentiableProfileSource.profile_id
+PROFILE_FORMS = ('composite', 'super_gaussian', 'sk_beam', 'physical')   # index = DifferentiableProfileSource.profile_id
+N_PROFILE_PARAMS = 9                     # params is padded to this length for the shorter forms
 
 
 def _power(x, k):
@@ -589,21 +593,88 @@ def _profile_sk_beam(alpha_deg, params):
     return jnp.exp(-jnp.tan(t) ** 4 / (2 * s * s)) / jnp.cos(t) ** 3
 
 
+# The physical diffuser model (profile_table_map.ipynb in the HKUKLI project, its baseline): a PTFE dome in a dry
+# torch behind a flat window, in water. Direct light: the dome's projected area (1 + cos t)/2 x cos^m t x a
+# logistic torch eclipse (theta_t, w_t) at internal angle t = asin(n_w sin a), times the Fresnel transmission
+# of the window's two faces and the solid-angle factor n_w^2 cos a / cos t; it all exits within asin(1/n_w).
+# Beyond that, a tail (B, lam_t, a_c, s_c). Then the scan's bench blur: a semicircle of half-width d_par
+# convolved with a Gaussian sig_g, on a fixed grid with the profile mirrored at a = 0 (the kernel's support
+# is fixed at +-_PHYS_KERNEL deg so shapes stay static; it truncates only if d_par + 4 sig_g exceeds it).
+_PHYS_N_WATER, _PHYS_N_GLASS = 1.34, 1.50
+_PHYS_DA = 0.05
+_PHYS_GRID = np.arange(0.0, 90.0 + _PHYS_DA / 2, _PHYS_DA)
+_PHYS_KERNEL = 15.0
+_PHYS_KX = np.arange(-int(round(_PHYS_KERNEL / _PHYS_DA)), int(round(_PHYS_KERNEL / _PHYS_DA)) + 1) * _PHYS_DA
+
+
+def _fresnel_T(ci, n1, n2):
+    """Unpolarised Fresnel transmittance n1 -> n2 at incidence cosine ci (0 beyond TIR)."""
+    s2t = (n1 / n2) ** 2 * (1 - ci ** 2)
+    ct = jnp.sqrt(jnp.clip(1 - s2t, 0, 1))
+    rs = ((n1 * ci - n2 * ct) / (n1 * ci + n2 * ct + 1e-12)) ** 2
+    rp = ((n2 * ci - n1 * ct) / (n2 * ci + n1 * ct + 1e-12)) ** 2
+    return jnp.where(s2t < 1, 1 - 0.5 * (rs + rp), 0.0)
+
+
+def _profile_physical(alpha_deg, params):
+    # params (m, theta_t, w_t, log B, lam_t, a_c, s_c, d_par, sig_g), angles in deg.
+    m, th_t, w_t, logB, lam_t, a_c, s_c, d_par, sig_g = (params[i] for i in range(9))
+    n_w, n_g = _PHYS_N_WATER, _PHYS_N_GLASS
+    a = jnp.asarray(_PHYS_GRID)
+    sa = n_w * jnp.sin(jnp.radians(a))
+    inside = sa < 1
+    ct = jnp.sqrt(jnp.clip(1 - sa ** 2, 1e-9, 1))
+    c_glass = jnp.sqrt(jnp.clip(1 - (sa / n_g) ** 2, 0, 1))
+    T = jnp.where(inside, _fresnel_T(ct, 1.0, n_g) * _fresnel_T(c_glass, n_g, n_w), 0.0)
+    jac = jnp.where(inside, n_w ** 2 * jnp.cos(jnp.radians(a)) / ct, 0.0)
+    theta = jnp.degrees(jnp.arcsin(jnp.clip(sa, 0, 1)))
+    cth = jnp.cos(jnp.radians(theta))
+    direct = (1 + cth) / 2 * _power(cth, m) * jax.nn.sigmoid((th_t - theta) / w_t) * T * jac
+    a_max = np.degrees(np.arcsin(1 / n_w))
+    tail = (jnp.exp(logB) * jax.nn.sigmoid((a - a_max) / 0.3) * jnp.exp(-jnp.clip(a - a_max, 0) / lam_t)
+            * jax.nn.sigmoid((a_c - a) / s_c))
+    y = direct + tail
+    x = jnp.asarray(_PHYS_KX)
+    semi = jnp.where(d_par > _PHYS_DA, jnp.sqrt(jnp.clip(1 - (x / jnp.maximum(d_par, 1e-6)) ** 2, 0, None)),
+                     (x == 0).astype(y.dtype))
+    gauss = jnp.exp(-0.5 * (x / jnp.maximum(sig_g, 1e-6)) ** 2)
+    k = jnp.where(sig_g > _PHYS_DA, jnp.convolve(semi, gauss, mode='same'), semi)
+    k = k / jnp.sum(k)
+    h = len(_PHYS_KX) // 2
+    yy = jnp.concatenate([y[h:0:-1], y, jnp.full(h, y[-1])])
+    return jnp.interp(alpha_deg, a, jnp.convolve(yy, k, mode='valid'))
+
+
 def profile_intensity(alpha_deg, params, profile_id):
     """Relative intensity per solid angle at off-axis angle ``alpha_deg`` for profile ``profile_id``
-    (an index into PROFILE_FORMS). ``params`` is a length-4 array, padded for the shorter forms."""
+    (an index into PROFILE_FORMS). ``params`` is a length-N_PROFILE_PARAMS array, padded for the
+    shorter forms."""
     return jax.lax.switch(profile_id, (_profile_composite, _profile_super_gaussian,
-                                       _profile_sk_beam), alpha_deg, params)
+                                       _profile_sk_beam, _profile_physical), alpha_deg, params)
 
 
-@partial(jax.jit, static_argnums=(7,))
-def sample_differentiable_profile_rays(position, rotation_axis, rotation_angle, params,
+_PROPOSAL_BINS = 2048     # equal-angle bins over the cap for the proposal's CDF
+_PROPOSAL_UNIFORM = 0.02  # share of the proposal spread uniformly over the cap, so every angle stays reachable
+
+
+@partial(jax.jit, static_argnums=(8,))
+def sample_differentiable_profile_rays(position, rotation_axis, rotation_angle, params, proposal,
                                        profile_id, alpha_cut_deg, intensity, n_photons, key):
     key_u, key_phi = random.split(key)
-    # Stratified in u = cos(alpha): one uniform draw per equal slice of the cap.
-    cos_cut = jnp.cos(jnp.radians(alpha_cut_deg))
-    q = (jnp.arange(n_photons) + random.uniform(key_u, (n_photons,))) / n_photons
-    u = cos_cut + (1.0 - cos_cut) * q
+    # The proposal: the profile at `proposal` per solid angle, binned in alpha, mixed with a uniform share.
+    # Each bin is uniform in u = cos(alpha) inside, so its density per solid angle is mass / du.
+    proposal = jax.lax.stop_gradient(proposal)
+    edges = jnp.linspace(0.0, alpha_cut_deg, _PROPOSAL_BINS + 1)
+    u_edges = jnp.cos(jnp.radians(edges))
+    du = u_edges[:-1] - u_edges[1:]
+    p_mid = profile_intensity(0.5 * (edges[1:] + edges[:-1]), proposal, profile_id) * du
+    mass = (1 - _PROPOSAL_UNIFORM) * p_mid / jnp.sum(p_mid) + _PROPOSAL_UNIFORM * du / jnp.sum(du)
+    cdf = jnp.concatenate([jnp.zeros(1), jnp.cumsum(mass)])
+
+    # Stratified: one draw per equal slice of the proposal's CDF.
+    q = (jnp.arange(n_photons) + random.uniform(key_u, (n_photons,))) / n_photons * cdf[-1]
+    b = jnp.clip(jnp.searchsorted(cdf, q, side='right') - 1, 0, _PROPOSAL_BINS - 1)
+    u = u_edges[b] - (q - cdf[b]) / mass[b] * du[b]
     phi = random.uniform(key_phi, (n_photons,)) * 2.0 * jnp.pi
     polar = jnp.arccos(jnp.clip(u, -1.0, 1.0))
 
@@ -613,9 +684,9 @@ def sample_differentiable_profile_rays(position, rotation_axis, rotation_angle, 
     ray_vectors = jax.vmap(lambda v: jax_rotate_vector(v, rotation_axis, rotation_angle))(d_native)
     ray_origins = jnp.tile(position[None, :], (n_photons, 1))
 
-    # The directions are a uniform sample of the cap, so weighting each by the profile reproduces
-    # it; normalising over the batch makes the weights sum to `intensity` exactly.
-    rel = profile_intensity(jnp.degrees(polar), params, profile_id)
+    # Each ray weighted by the profile over the density it was drawn from reproduces the profile;
+    # normalising over the batch makes the weights sum to `intensity` exactly.
+    rel = profile_intensity(jnp.degrees(polar), params, profile_id) / (mass[b] / du[b])
     photon_weights = intensity * rel / jnp.sum(rel)
     return ray_vectors, ray_origins, photon_weights
 
@@ -623,15 +694,17 @@ def sample_differentiable_profile_rays(position, rotation_axis, rotation_angle, 
 class DifferentiableProfileSource(NamedTuple):
     """Calibration source whose angular profile is differentiable in its parameters.
 
-    Usage: ``source(n_photons, key)``. Directions are uniform over the cap ``alpha <= alpha_cut``;
-    the profile (``PROFILE_FORMS[profile_id]`` at ``params``) lives in the ray weights. Gradients
-    flow to ``params`` (and ``intensity``), not to the directions. Built via
-    :func:`differentiable_profile_source`.
+    Usage: ``source(n_photons, key)``. Directions are drawn over the cap ``alpha <= alpha_cut`` from
+    the profile at ``proposal`` (the parameters the source was built with); the profile
+    (``PROFILE_FORMS[profile_id]`` at ``params``) lives in the ray weights, as its ratio to the
+    proposal. Gradients flow to ``params`` (and ``intensity``), not to the directions, so replacing
+    ``params`` never moves a ray. Built via :func:`differentiable_profile_source`.
     """
     position: jnp.ndarray
     rotation_axis: jnp.ndarray
     rotation_angle: jnp.ndarray
-    params: jnp.ndarray          # (4,), padded for the shorter forms
+    params: jnp.ndarray          # (N_PROFILE_PARAMS,), padded for the shorter forms
+    proposal: jnp.ndarray        # (N_PROFILE_PARAMS,), the parameters the directions are drawn at
     profile_id: jnp.ndarray      # int, index into PROFILE_FORMS
     alpha_cut: jnp.ndarray       # deg, half-angle of the sampled cap
     intensity: jnp.ndarray = jnp.float32(1.0)
@@ -639,7 +712,7 @@ class DifferentiableProfileSource(NamedTuple):
 
     def __call__(self, n_photons, key, n_water=1.33):
         return sample_differentiable_profile_rays(
-            self.position, self.rotation_axis, self.rotation_angle, self.params,
+            self.position, self.rotation_axis, self.rotation_angle, self.params, self.proposal,
             self.profile_id, self.alpha_cut, self.intensity, n_photons, key,
         )
 
@@ -652,7 +725,9 @@ def differentiable_profile_source(position, direction, params, alpha_cut, profil
     ----------
     params : sequence
         Profile parameters, angles in degrees: ``composite`` (w, p, a0, s);
-        ``super_gaussian`` (w, p); ``sk_beam`` (sigbm,).
+        ``super_gaussian`` (w, p); ``sk_beam`` (sigbm,); ``physical`` (m, theta_t, w_t, log B, lam_t,
+        a_c, s_c, d_par, sig_g). Also the proposal the directions are drawn from: build the source at
+        the profile a fit will stay near.
     alpha_cut : float
         Half-angle (deg) of the sampled cap; must contain all the emitted light.
     profile : str
@@ -660,7 +735,7 @@ def differentiable_profile_source(position, direction, params, alpha_cut, profil
     """
     if profile not in PROFILE_FORMS:
         raise ValueError(f'profile must be one of {PROFILE_FORMS}, got {profile!r}')
-    p = jnp.zeros(4, dtype=jnp.float32).at[:len(params)].set(jnp.asarray(params, dtype=jnp.float32))
+    p = jnp.zeros(N_PROFILE_PARAMS, dtype=jnp.float32).at[:len(params)].set(jnp.asarray(params, dtype=jnp.float32))
     rotation_axis, rotation_angle = _axis_angle_from_x_axis(jnp.asarray(direction, dtype=jnp.float32))
     wl = jnp.asarray(float(wavelength), dtype=jnp.float32) if wavelength is not None else None
     return DifferentiableProfileSource(
@@ -668,6 +743,7 @@ def differentiable_profile_source(position, direction, params, alpha_cut, profil
         rotation_axis=rotation_axis,
         rotation_angle=rotation_angle,
         params=p,
+        proposal=p,
         profile_id=jnp.asarray(PROFILE_FORMS.index(profile), dtype=jnp.int32),
         alpha_cut=jnp.asarray(float(alpha_cut), dtype=jnp.float32),
         intensity=jnp.asarray(float(intensity), dtype=jnp.float32),

@@ -27,6 +27,10 @@ __all__ = [
     "sample_differentiable_profile_rays",
     "profile_intensity",
     "PROFILE_FORMS",
+    "N_PROFILE_PARAMS",
+    "load_injectors",
+    "injector_position_direction",
+    "injector_sources",
     "ShotgunSource",
     "shotgun_source",
     "stack_shotgun_sources",
@@ -56,6 +60,10 @@ from lucid.sources.calibration_sources import (
     sample_differentiable_profile_rays,
     profile_intensity,
     PROFILE_FORMS,
+    N_PROFILE_PARAMS,
+)
+from lucid.sources.hk_injectors import (
+    load_injectors, injector_position_direction, injector_sources,
 )
 from lucid.sources.shotgun_source import (
     ShotgunSource,

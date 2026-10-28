@@ -1,17 +1,14 @@
 """Build measured-profile calibration sources from the real HK injector survey
-(UKLIinfo/LightInjectorsDetails.json). Shared by run_calibration.py and
-calibration_gradients_job.py so both build sources the same way.
+(LightInjectorsDetails.json) and the Warwick scans of each unit (common_profiles/<sample_id>.npz,
+see load_HKLI_profile). Both data sets are collaboration data and live outside the repository, so
+every function takes their paths.
 """
 import json
-from pathlib import Path
 
-from lucid.sources import measured_profile_source
-
-INJECTORS_PATH = 'UKLIinfo/LightInjectorsDetails.json'
-COMMON_DIR = Path('common_profiles')
+from lucid.sources.calibration_sources import measured_profile_source
 
 
-def load_injectors(injector_type, detector='ID', injectors_path=INJECTORS_PATH):
+def load_injectors(injector_type, detector='ID', *, injectors_path):
     """All survey entries of one type ('diffuser' or 'collimator') for one detector
     region ('ID' or 'OD')."""
     injectors = json.load(open(injectors_path))['injectors']
@@ -28,7 +25,7 @@ def _true_position(e):
     return [c / 100.0 for c in e['position']]
 
 
-def injector_position_direction(injector_type, idx, detector='ID', injectors_path=INJECTORS_PATH):
+def injector_position_direction(injector_type, idx, detector='ID', *, injectors_path):
     """(position_m, direction) for exactly one injector entry (offset-applied), e.g. to
     build a laser_source/isotropic_source at the same spot as a measured-profile one."""
     entries = load_injectors(injector_type, detector=detector, injectors_path=injectors_path)
@@ -39,9 +36,8 @@ def injector_position_direction(injector_type, idx, detector='ID', injectors_pat
     return _true_position(e), e['direction']
 
 
-def injector_sources(injector_type, sample_id, idx=None, *, detector='ID',
-                     common_profiles_dir=COMMON_DIR, intensity=1e6,
-                     injectors_path=INJECTORS_PATH):
+def injector_sources(injector_type, sample_id, idx=None, *, injectors_path, common_profiles_dir,
+                     detector='ID', intensity=1e6):
     """measured_profile_source(...) instances at real injector positions, all built from
     the one loaded `sample_id` profile (e.g. 'WarwickDA02' for diffuser,
     'WarwickCol_C01_repeat' for collimator).
