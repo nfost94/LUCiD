@@ -47,7 +47,7 @@ digitizer or trigger either, so a `GeV` config on it must state both.
 
 ## Digitizer
 
-The digitizer models (`basic`, `ski`, `hk`), where the `"digitizer"` and `"trigger"` blocks
+The digitizer models (`basic`, `ski`, `hk`, `ski_wcsim`, `hk_wcsim`), where the `"digitizer"` and `"trigger"` blocks
 are read from, and their overrides are in
 [digitizer and trigger](../../docs/reference/digitizer-and-trigger.md). Models other than
 `basic` can record several digits per sensor. Dark noise is a labelled source in `hits.h5`

@@ -24,6 +24,7 @@ The shipped blocks:
 |---|---|---|
 | `SK_WAND` | `{"model": "ski"}` | `window_ns` 200, `n_thr` 25, `pad_before_ns` 300, `pad_after_ns` 300 |
 | `HK_WAND` | `{"model": "hk"}` | `window_ns` 200, `n_thr` 45, `pad_before_ns` 300, `pad_after_ns` 300 |
+| `HK_WCSIM` | `hk_wcsim`, dead time 560 ns, TDC 0.1 ns, `pe_precision` 0.3, dark 4.6725 kHz | `{"model": "hk"}` (WCSim's NDigits trigger, below) |
 
 ## Digitizer
 
@@ -35,9 +36,16 @@ preset value (for example `"dark_rate_khz"` or `"threshold_pe"`).
 | `basic` | infinite | 0 pe | SK-like fractional smearing | none | none | 0 |
 | `ski` | 200 ns | 0.25 pe | sampled SK single-photoelectron spectrum | SK Gaussian jitter | 0.4 ns | 4.2 kHz |
 | `hk` | 200 ns | 0.25 pe | sampled HK single-photoelectron spectrum | HK exponentially modified Gaussian | 0.4 ns | 4.2 kHz |
+| `ski_wcsim` | 200 ns | WCSim's S-curve | as `ski` | as `ski` | 0.4 ns, truncated | 4.2 kHz |
+| `hk_wcsim` | 200 ns | WCSim's S-curve | HK spectrum refitted to `BoxandLine20inchHQE::Getqpe` | as `hk` | 0.4 ns, truncated | 4.2 kHz |
 
-Dead time is 0 in all three. `ski` and `hk` follow WCSim's SKI digitizer and its SK and HK PMT
-models; `basic` is an idealised pass-through with one digit per hit PMT.
+Dead time is 0 in all of them. `ski` and `hk` follow WCSim's SKI digitizer and its SK and HK PMT
+models; `basic` is an idealised pass-through with one digit per hit PMT. `ski_wcsim` and
+`hk_wcsim` are `ski` and `hk` as WCSim runs them: the discriminator fires with probability
+P(fire | q) on the digitised charge (`WCSimWCDigitizerSKI::Threshold`: 11% at 0.1 pe, 54% at
+0.25, 82% at 0.5, certain from 1 pe), and the TDC truncates toward zero, as WCSim's `Truncate`
+does, where the others round. Any preset can truncate a digit's charge to a multiple of
+`pe_precision` pe (WCSim's `PEPrecision`); every preset has 0, WCSim's default.
 
 Per sensor: sort the hits by time, open a window at the first, sum the charge in it, record a
 digit if the sum clears the threshold, then repeat from the next hit after the window (and dead
@@ -66,6 +74,11 @@ count reaches `n_thr` (moved earlier by `pad_before_ns`) and closes where it dro
 An event with no gate is dropped from the dataset entirely, leaving a gap in
 `source_event_idx`. Gates are written to `labl/.../per_window`
 ([schema](dataset-schema.md)).
+
+`{"model": "hk", ...}` is instead WCSim's NDigits trigger as the HK production runs it
+(`HKTrigger`: `threshold` 25 raised for dark noise, `window_ns` 200, `pad_before_ns` 400,
+`pad_after_ns` 950, `noise_dark_rate_khz` 4.2, `n_pmts` 19746): fixed readout gates around the
+time of the digit that fires it, rounded down to WCSim's 5 ns step.
 
 Digit times are rounded to the 0.4 ns TDC step, and 200 ns is a multiple of it, so an event
 exactly at `n_thr` can flip on a one-tick change in one arrival.

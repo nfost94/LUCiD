@@ -16,14 +16,18 @@ one-hit-per-sensor behaviour.
 Models. Every electronics/PMT number is taken from the WCSim source (the SK/HK
 reference simulation); citations are ``WCSim/...`` paths, verifiable in the
 checkout. ``basic`` is the idealized passthrough (kept for backward parity);
-``ski`` and ``hk`` are physical models differing in their PMT response:
+``ski`` and ``hk`` are physical models differing in their PMT response, and
+``ski_wcsim`` / ``hk_wcsim`` are the same with WCSim's discriminator S-curve in
+place of the sharp threshold (and, for HK, a closer SPE fit):
 
-    basic  window=inf,  deadtime=0, thr=0     — legacy first-arrival + summed charge
-    ski    window=200ns, deadtime=0, thr=0.25pe, dark=4.2kHz — SK 20" (WCSim PMT20inch)
-    hk     window=200ns, deadtime=0, thr=0.25pe, dark=4.2kHz — HK 20" Box&Line (R12860)
+    basic      window=inf,  deadtime=0, thr=0                          — legacy first-arrival + summed charge
+    ski        window=200ns, deadtime=0, thr=0.25pe,       dark=4.2kHz — SK 20" (WCSim PMT20inch)
+    hk         window=200ns, deadtime=0, thr=0.25pe,       dark=4.2kHz — HK 20" Box&Line (R12860)
+    ski_wcsim  window=200ns, deadtime=0, WCSim S-curve,    dark=4.2kHz — ski, WCSim's discriminator
+    hk_wcsim   window=200ns, deadtime=0, WCSim S-curve,    dark=4.2kHz — hk, WCSim's discriminator
 
-``thr`` is the discriminator, applied after charge smearing (see below), not
-during windowing.
+The discriminator is applied after charge smearing (see below), not during
+windowing.
 
 Provenance (all in ``WCSim/``, the checkout alongside LUCiD):
   * window 200 ns / deadtime 0 ns — ``include/WCSimWCDigitizer.hh:97-98`` (the
@@ -38,23 +42,35 @@ Provenance (all in ``WCSim/``, the checkout alongside LUCiD):
   * dark rate 4.2 kHz — ``src/WCSimPMTObject.cc:262`` (SK-I; WCSim uses the same
     value for the HK B&L PMT, ``:2295``).
 
-Discriminator. ``threshold_pe`` is applied to the **digitised** charge, after
-the SPE spectrum has been sampled — a discriminator fires on the analogue
-pulse, so a single photoelectron whose charge fluctuates low is genuinely
-lost. Ordering it the other way (cutting on the integrated photoelectron
-count) makes the cut inert, since any hit sensor has at least one
-photoelectron; that yields ``P(hit|mu) = 1 - exp(-mu)`` exactly and leaves
-~18% of digits below the nominal threshold. The time jitter reads the same
-digitised charge, so a pulse that fluctuates low is also timed as one.
+Discriminator. It acts on the **digitised** charge, after the SPE spectrum has
+been sampled — a discriminator fires on the analogue pulse, so a single
+photoelectron whose charge fluctuates low is genuinely lost. Ordering it the
+other way (cutting on the integrated photoelectron count) makes the cut inert,
+since any hit sensor has at least one photoelectron; that yields
+``P(hit|mu) = 1 - exp(-mu)`` exactly. The time jitter reads the same digitised
+charge, so a pulse that fluctuates low is also timed as one.
 
-WCSim instead applies a measured S-curve ``P(fire | charge)``
-(``WCSimWCDigitizerSKI::Threshold``), an SK-specific calibration inherited
-from SKDETSIM's ``skrn1pe`` with no derivation in the source. We deliberately
-keep a single sharp threshold at its 50% point: these are SK-*like*
-detectors, not SK, and one explicit number applies on the same terms to SK
-and HK. The PMT dependence then enters only where it should — through the
-SPE spectrum, which is broad for SK and narrow for HK, so the same cut keeps
-~77% of single-photoelectron hits in SK and ~92% in HK.
+``ski`` and ``hk`` keep a single sharp ``threshold_pe`` at the 50% point of
+WCSim's S-curve: these are SK-*like* detectors, not SK, and one explicit number
+applies on the same terms to SK and HK. The PMT dependence then enters only
+where it should — through the SPE spectrum, which is broad for SK and narrow
+for HK, so the same cut keeps ~77% of single-photoelectron hits in SK and ~92%
+in HK.
+
+``ski_wcsim`` and ``hk_wcsim`` use WCSim's cut instead: a digit fires with
+probability ``P(fire | q)``, the S-curve of ``WCSimWCDigitizerSKI::Threshold``
+(``include/WCSimWCDigitizer.hh:102-123``, inherited from SKDETSIM), rising from
+11% at 0.1 p.e. through 54% at 0.25 p.e. to 1 above 1 p.e. of raw SPE-table
+charge (see :func:`discriminator_efficiency`). WCSim also adds 0.03 p.e. of
+Gaussian noise to a digit that fires; that is omitted here, beside an SPE width
+of ~0.45 p.e. The curve keeps ~73% of single-photoelectron hits in SK and ~90%
+in HK, through the SPE spectra.
+
+Charge precision. WCSim stores each digit's charge truncated to a multiple of
+``PEPrecision`` (``AddNewDigit``, ``src/WCSimWCDigitizer.cc:132``), after the
+discriminator has decided on the full charge, so a digit below one step is
+kept with charge 0. ``pe_precision`` is that step: 0 (no truncation, WCSim's
+default) in every preset; a detector config sets its macro's value.
 
 The model is chosen from the detector physics config (a ``"digitizer"`` block);
 absent ⇒ ``basic``. Dark noise is off by default; when enabled it is generated
@@ -69,7 +85,7 @@ per sensor and runs host-side after the simulation kernel.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
+from typing import NamedTuple, Optional, Union
 
 import numpy as np
 
@@ -82,21 +98,48 @@ import numpy as np
 # (resolution) is preserved. KS vs the tabulated LUT quoted per PMT.
 _SPE_SK = dict(w=0.2970, mu=1.1288, sig=0.5587, tau=0.1978, fit_mean=0.852)  # KS 5.1%
 _SPE_HK = dict(w=0.2026, mu=1.1019, sig=0.3495, tau=0.5857, fit_mean=0.997)  # KS 1.0%
+# hk_wcsim: minimum-KS fit to BoxandLine20inchHQE::Getqpe's piecewise-linear CDF (rn1pe draws
+# uniformly in bins of 1/22.83 p.e.). Table: mean 1.020, rms 0.441, 6.6% below 0.25 p.e.; fit:
+# 1.024, 0.453, 7.0%.
+_SPE_HK_WCSIM = dict(w=0.1580, mu=1.1215, sig=0.3690, tau=0.5006, fit_mean=1.0235)  # KS 0.8%
+
+# --- Discriminator -----------------------------------------------------------
+# WCSimWCDigitizerSKI::Threshold (include/WCSimWCDigitizer.hh:102-123): P(fire | q) is this
+# polynomial in x = q + 0.1 below x = 1.1, capped at 1, and 1 above, where q is the raw
+# SPE-table charge. Coefficients lowest order first.
+_SKI_THRESHOLD = (
+    -0.06374,
+    3.748,
+    -63.23,
+    452.0,
+    -1449.0,
+    2513.0,
+    -2529.0,
+    1472.0,
+    -452.2,
+    51.34,
+    2.370,
+)
 
 # --- Model presets -----------------------------------------------------------
-# window/deadtime in ns; threshold in p.e.; dark_rate_khz per PMT.
+# window/deadtime in ns; threshold in p.e.; pe_precision in p.e.; dark_rate_khz per PMT.
+#   threshold_pe:    sharp discriminator threshold, used when threshold_curve is None.
+#   threshold_curve: WCSim's discriminator S-curve coefficients (``_SKI_THRESHOLD``), or None.
 #   charge_model: "legacy" (basic → the old sk_like fractional smear, for parity)
 #                 or "spe"  (sample+sum the per-pe SPE spectrum in ``spe``).
 #   time_model:   "none" | "sk_gauss" | "hk_emg"  (charge-dependent PMT jitter), evaluated
 #                 on the digitised charge floored at jitter_floor_pe; tdc_ns is the
-#                 electronics timing truncation applied after.
+#                 electronics timing step applied after: rounded to the nearest step, or
+#                 truncated toward zero as WCSim's Truncate does (tdc_truncate, the *_wcsim presets).
 MODEL_PRESETS: dict[str, dict] = {
     "basic": dict(
         integration_window_ns=None,
         deadtime_ns=0.0,
         threshold_pe=0.0,
+        threshold_curve=None,
         charge_model="legacy",
         charge_res="sk_like",
+        pe_precision=0.0,
         time_model="none",
         tdc_ns=0.0,
         dark_rate_khz=0.0,
@@ -106,8 +149,10 @@ MODEL_PRESETS: dict[str, dict] = {
         integration_window_ns=200.0,
         deadtime_ns=0.0,
         threshold_pe=0.25,
+        threshold_curve=None,
         charge_model="spe",
         spe=_SPE_SK,
+        pe_precision=0.0,
         time_model="sk_gauss",
         jitter_floor_pe=0.5,
         tdc_ns=0.4,
@@ -118,11 +163,43 @@ MODEL_PRESETS: dict[str, dict] = {
         integration_window_ns=200.0,
         deadtime_ns=0.0,
         threshold_pe=0.25,
+        threshold_curve=None,
         charge_model="spe",
         spe=_SPE_HK,
+        pe_precision=0.0,
         time_model="hk_emg",
         jitter_floor_pe=0.5,
         tdc_ns=0.4,
+        dark_rate_khz=4.2,
+        provisional=False,
+    ),
+    "ski_wcsim": dict(
+        integration_window_ns=200.0,
+        deadtime_ns=0.0,
+        threshold_pe=0.0,
+        threshold_curve=_SKI_THRESHOLD,
+        charge_model="spe",
+        spe=_SPE_SK,
+        pe_precision=0.0,
+        time_model="sk_gauss",
+        jitter_floor_pe=0.5,
+        tdc_ns=0.4,
+        tdc_truncate=True,
+        dark_rate_khz=4.2,
+        provisional=False,
+    ),
+    "hk_wcsim": dict(
+        integration_window_ns=200.0,
+        deadtime_ns=0.0,
+        threshold_pe=0.0,
+        threshold_curve=_SKI_THRESHOLD,
+        charge_model="spe",
+        spe=_SPE_HK_WCSIM,
+        pe_precision=0.0,
+        time_model="hk_emg",
+        jitter_floor_pe=0.5,
+        tdc_ns=0.4,
+        tdc_truncate=True,
         dark_rate_khz=4.2,
         provisional=False,
     ),
@@ -366,7 +443,7 @@ def _sample_spe_charge(pe_true: np.ndarray, spe: dict, rng: np.random.Generator)
 def _sample_time_jitter(
     digit_time: np.ndarray, digit_pe: np.ndarray, model: dict, rng: np.random.Generator
 ) -> np.ndarray:
-    """Charge-dependent PMT time jitter + electronics TDC truncation.
+    """Charge-dependent PMT time jitter + the electronics TDC step.
 
     ``digit_pe`` is the digitised charge, floored at the model's ``jitter_floor_pe``.
 
@@ -374,8 +451,14 @@ def _sample_time_jitter(
         Gaussian, sigma = max(0.58, 0.33 + sqrt(10/Q)) ns.
     ``hk_emg``   — WCSim ``BoxandLine20inchHQE::HitTimeSmearing`` (``:2124-2138``):
         exponentially-modified Gaussian, Normal(-0.2, sigma(Q)) plus a positive
-        exponential late tail of mean 1/lambda(Q).
-    Then truncate to the TDC step ``tdc_ns`` (WCSim SKI timing precision 0.4 ns).
+        exponential late tail of mean 1/lambda(Q). The model may set ``emg_mean_ns`` (the Gaussian's
+        mean, -0.2), ``emg_sigma_scale`` (a factor on sigma(Q), 1) and ``emg_tail_scale`` (a factor on
+        the tail's mean 1/lambda(Q), 1) to vary it; the defaults are WCSim's.
+    Then the TDC step ``tdc_ns`` (SKI timing precision 0.4 ns, HK production 0.1 ns): rounded to
+    the nearest step, or, with ``tdc_truncate`` (the ``*_wcsim`` presets), truncated toward zero as
+    WCSim's ``Truncate`` (``WCSimWCDigitizer.hh``) does when it stores a digit, so that a recorded
+    time is up to one step earlier than the time it was made at, half a step on average (for
+    positive times). Either acts on the detector-frame time.
     """
     t = np.asarray(digit_time, dtype=np.float64).copy()
     if t.size == 0:
@@ -392,26 +475,74 @@ def _sample_time_jitter(
         hc1 = s[0] * ((1 - 2 * s[1] * s[3]) * np.exp(-s[1] * s[3]) + s[2])
         sig = np.where(Q < s[3], sig_low, hc0 / np.sqrt(Q) + hc1)
         lam = 0.4113 + 0.07827 * Q  # WCSim lambda_param
-        t = t + rng.normal(-0.2, sig) - np.log(1.0 - rng.random(t.shape)) / lam
+        # Optional model keys, for studying the jitter: the defaults are WCSim's.
+        mean = float(model.get("emg_mean_ns", -0.2))
+        sig_scale = float(model.get("emg_sigma_scale", 1.0))
+        tail_scale = float(model.get("emg_tail_scale", 1.0))
+        t = (
+            t
+            + rng.normal(mean, sig * sig_scale)
+            - tail_scale * np.log(1.0 - rng.random(t.shape)) / lam
+        )
     tdc = float(model.get("tdc_ns", 0.0))
     if tdc > 0.0:
-        t = np.round(t / tdc) * tdc
+        t = (np.trunc if model.get("tdc_truncate", False) else np.round)(t / tdc) * tdc
     return t
 
 
-def apply_discriminator(pe_reco: np.ndarray, model: dict) -> np.ndarray:
+def discriminator_efficiency(pe_reco: np.ndarray, model: dict) -> np.ndarray:
+    """P(fire | digitised charge).
+
+    With a ``threshold_curve`` (``*_wcsim``), WCSim's S-curve: WCSim evaluates it on the raw
+    SPE-table charge, whose mean per photoelectron is the SPE spectrum's ``fit_mean``; LUCiD's
+    charge is normalised to a mean of 1 p.e. (:func:`_sample_spe_charge`), so it is scaled back
+    first. Otherwise the sharp ``threshold_pe``: 1 at or above it, 0 below (``basic``: always 1).
+    """
+    pe_reco = np.asarray(pe_reco, dtype=np.float64)
+    curve = model.get("threshold_curve")
+    if curve is None:
+        threshold = float(model.get("threshold_pe", 0.0))
+        return (
+            (pe_reco >= threshold).astype(np.float64) if threshold > 0.0 else np.ones(pe_reco.shape)
+        )
+    x = pe_reco * model["spe"]["fit_mean"] + 0.1
+    p = np.polynomial.polynomial.polyval(x, curve)
+    return np.where(x < 1.1, np.clip(p, 0.0, 1.0), 1.0)
+
+
+def apply_discriminator(
+    pe_reco: np.ndarray, model: dict, rng: Optional[np.random.Generator] = None
+) -> np.ndarray:
     """Which digits survive the discriminator, given their **digitised** charge.
 
-    A discriminator fires on the analogue pulse, so this runs after the SPE
-    spectrum has been sampled -- see the module docstring for why the ordering
-    is load-bearing and why a single sharp threshold is preferred here over
-    WCSim's SK-specific S-curve.
+    A sharp ``threshold_pe`` keeps a digit at or above it; WCSim's S-curve (``threshold_curve``)
+    fires each digit with probability :func:`discriminator_efficiency`, drawn from ``rng``. A
+    discriminator fires on the analogue pulse, so this runs after the SPE spectrum has been
+    sampled -- see the module docstring for why the order matters.
     """
-    threshold = float(model.get("threshold_pe", 0.0))
     pe_reco = np.asarray(pe_reco)
-    if threshold <= 0.0:
-        return np.ones(pe_reco.shape, dtype=bool)
-    return pe_reco >= threshold
+    if model.get("threshold_curve") is None:
+        threshold = float(model.get("threshold_pe", 0.0))
+        if threshold <= 0.0:
+            return np.ones(pe_reco.shape, dtype=bool)
+        return pe_reco >= threshold
+    if rng is None:
+        raise ValueError("the WCSim discriminator S-curve (threshold_curve) needs an rng")
+    return rng.random(pe_reco.shape) < discriminator_efficiency(pe_reco, model)
+
+
+def apply_charge_precision(pe_reco: np.ndarray, model: dict) -> np.ndarray:
+    """Truncate digit charge toward zero to a multiple of ``pe_precision`` p.e., as
+    WCSim's ``AddNewDigit`` does (``src/WCSimWCDigitizer.cc:132``).
+
+    Runs after the discriminator, which decides on the full charge, so a digit
+    below one step is kept with charge 0. ``pe_precision`` 0 leaves charge as is.
+    """
+    pe_reco = np.asarray(pe_reco)
+    step = float(model.get("pe_precision", 0.0))
+    if step <= 0.0:
+        return pe_reco
+    return (step * np.floor(pe_reco.astype(np.float64) / step)).astype(pe_reco.dtype)
 
 
 def apply_readout_resolution(
@@ -440,6 +571,128 @@ def apply_readout_resolution(
         pe_reco = np.clip(pe_true + rng.normal(size=pe_true.shape) * sigma, 0.0, None)
     t = _sample_time_jitter(digit_time, pe_reco, model, rng)
     return pe_reco.astype(np.float32), t.astype(_T_DTYPE)
+
+
+def single_pe_time_response(
+    model: dict,
+    bin_ns: float,
+    t_lo_ns: float = -10.0,
+    t_hi_ns: float = 60.0,
+    n_draws: int = 10_000_000,
+    seed: int = 0,
+    chunk: int = 2_000_000,
+):
+    """The digitiser's response to ONE photoelectron arriving at t = 0, on a time grid: ``(kernel, centre)``.
+
+    ``kernel[j]`` is the probability that the PE becomes a recorded digit whose time lies within half a bin of ``(j - centre) * bin_ns``: the digit's charge is sampled from the SPE
+    spectrum, its time gets the charge-dependent jitter and the TDC truncation, and the discriminator fires on that charge, the steps :func:`apply_readout_resolution` and
+    :func:`apply_discriminator` take in :func:`digitize_and_decompose`. Sampled with those functions, so the kernel cannot drift from them. Its sum is the discriminator's
+    single-PE efficiency. Convolving an expected waveform with it (``sensor_response.apply_time_response``) gives the waveform of the PEs that become digits, at the
+    times the digitiser records them: exact for a digit made of one PE, the low-occupancy case (a digit of several PEs has a larger charge, less jitter and a likelier discriminator).
+    """
+    rng = np.random.default_rng(seed)
+    centre = int(round(-t_lo_ns / bin_ns))
+    n_bins = centre + int(round(t_hi_ns / bin_ns)) + 1
+    edges = (np.arange(n_bins + 1) - centre - 0.5) * bin_ns
+    counts = np.zeros(n_bins)
+    done = 0
+    while done < n_draws:
+        m = min(chunk, n_draws - done)
+        pe, t = apply_readout_resolution(np.ones(m), np.zeros(m), model, rng)
+        keep = apply_discriminator(pe, model, rng)
+        counts += np.histogram(t[keep], bins=edges)[0]
+        done += m
+    return counts / n_draws, centre
+
+
+class DigitKernels(NamedTuple):
+    """The digitiser's response to a window of m photoelectrons, m = 1 ... n_max, on a time grid and a charge grid (:func:`digit_response_kernels`).
+
+    ``time[m - 1, j]``: the probability that the digit is kept and lands ``j - centre`` bins after the window's first PE. ``charge_time[m - 1, j]``: the same weighted by the digit's recorded
+    charge (PE). ``charge_pmf[m - 1, k]``: the probability that the digit is kept and records ``charge_levels[k]`` (PE). Each row of ``time`` and of ``charge_pmf`` sums to the probability that a
+    window of m PEs gives a digit.
+    """
+
+    time: np.ndarray
+    charge_time: np.ndarray
+    charge_pmf: np.ndarray
+    centre: int
+    charge_levels: np.ndarray
+    charge_step: float
+
+
+def digit_response_kernels(
+    model: dict,
+    bin_ns: float,
+    n_max: int,
+    t_lo_ns: float = -10.0,
+    t_hi_ns: float = 60.0,
+    n_draws: int = 1_000_000,
+    seed: int = 0,
+    chunk: int = 1_000_000,
+) -> DigitKernels:
+    """The digitiser's response to a window holding m photoelectrons, for m = 1 ... ``n_max``: where its digit lands in time and what charge it records.
+
+    The digit of a window of m PEs is the window's first PE, delayed by the charge-dependent jitter of the SPE sum of m draws, kept with the discriminator's probability for that charge, and recorded
+    with the charge step applied. The kernels are sampled with the digitiser's own functions (:func:`apply_readout_resolution`, :func:`discriminator_efficiency`,
+    :func:`apply_charge_precision`), so they cannot drift from them; the discriminator is taken in expectation rather than drawn. They depend on the digitiser model only, not on any fitted parameter:
+    sample them once and hold them as constants (``hits.digit_expectation`` mixes them over the number of PEs in each window).
+
+    The time grid runs from ``t_lo_ns`` to ``t_hi_ns`` after the first PE's bin, in bins of ``bin_ns``; a digit outside it is lost. The first PE sits at the centre of its bin, which starts at a multiple of ``bin_ns`` on the
+    absolute time axis, with its phase on the TDC grid uniform over one step. The TDC acts on the absolute grid (truncating, for the *_wcsim presets, as WCSim does), so with ``bin_ns`` a multiple of the TDC step a bin's edges sit on the grid and a
+    digit stays in its time's bin but is recorded up to a step early (half a step on average): an effective advance that a PE placed at one phase of the grid misses. The charge grid is the model's charge step (``pe_precision``; 0.1 PE when
+    the model has none) up to the largest charge ``n_max`` PEs can reach; any charge above it is put on the last level. ``n_draws`` windows are drawn for each m.
+
+    A binned rate does not say where in its bin a PE arrived, and a PE put at the bin's centre adds a uniform spread of one bin to the continuous arrival times, a variance ``bin_ns ** 2 / 12`` (Sheppard's correction):
+    digits computed from the binned rate are too broad by it, which shows as a deficit just before a sharp rise and an excess just after it, of a fraction of a percent of the cells at a 0.5 ns bin. The time kernels (``time``,
+    ``charge_time``) are therefore deconvolved by that spread, to second order, by :func:`_remove_bin_spread`; their sums are unchanged. (Spreading the PE uniformly over its bin instead would add a second such variance.)
+    """
+    rng = np.random.default_rng(seed)
+    centre = int(round(-t_lo_ns / bin_ns))
+    n_bins = centre + int(round(t_hi_ns / bin_ns)) + 1
+    edges = (
+        np.arange(n_bins + 1) - centre
+    ) * bin_ns  # bin `centre` is [0, bin_ns): the bin the first PE is in
+    dither = float(
+        model.get("tdc_ns", 0.0)
+    )  # one step of the TDC: the phase of a continuous PE time on its grid
+    step = float(model.get("pe_precision", 0.0))
+    if step <= 0.0:
+        step = 0.1
+    n_levels = int(np.ceil((n_max + 6.0 * np.sqrt(n_max) + 6.0) / step)) + 1
+    time_k = np.zeros((n_max, n_bins))
+    charge_time_k = np.zeros((n_max, n_bins))
+    charge_pmf = np.zeros((n_max, n_levels))
+    for m in range(1, n_max + 1):
+        done = 0
+        while done < n_draws:
+            k = min(chunk, n_draws - done)
+            pe, t = apply_readout_resolution(
+                np.full(k, float(m)), 0.5 * bin_ns + dither * rng.uniform(-0.5, 0.5, k), model, rng
+            )  # the first PE at its bin's centre, its phase on the TDC grid uniform
+            keep = discriminator_efficiency(pe, model)
+            q = np.asarray(apply_charge_precision(pe, model), dtype=np.float64)
+            time_k[m - 1] += np.histogram(t, bins=edges, weights=keep)[0]
+            charge_time_k[m - 1] += np.histogram(t, bins=edges, weights=keep * q)[0]
+            level = np.minimum(np.rint(q / step).astype(np.int64), n_levels - 1)
+            charge_pmf[m - 1] += np.bincount(level, weights=keep, minlength=n_levels)
+            done += k
+    return DigitKernels(
+        _remove_bin_spread(time_k / n_draws),
+        _remove_bin_spread(charge_time_k / n_draws),
+        charge_pmf / n_draws,
+        centre,
+        np.arange(n_levels) * step,
+        step,
+    )
+
+
+def _remove_bin_spread(kernel: np.ndarray) -> np.ndarray:
+    """Deconvolve rows of time kernels (m, bins) by the spread of one bin, to second order: K(j) - (K(j + 1) - 2 K(j) + K(j - 1)) / 24, since a uniform spread of one bin adds the variance bin_ns ** 2 / 12,
+    that is ``(bin_ns ** 2 / 24) f''`` to a density f, and a second difference over bin_ns ** 2 is ``f''``. Each row's sum is unchanged apart from the grid's two ends (empty tails); the few entries
+    this makes negative, a twenty-fourth of a neighbour in an empty tail, are set to zero."""
+    p = np.pad(kernel, ((0, 0), (1, 1)))
+    return np.maximum(kernel - (p[:, 2:] - 2.0 * kernel + p[:, :-2]) / 24.0, 0.0)
 
 
 def _encode_keys(key_cols):
@@ -616,7 +869,7 @@ def digitize_and_decompose(
     # fluctuates low is lost as it would be in hardware. Surviving digits are
     # renumbered and every deposit's digit_idx remapped, so the decompositions
     # below stay consistent foreign keys into sensor.h5.
-    keep = apply_discriminator(pe_reco, model)
+    keep = apply_discriminator(pe_reco, model, rng)
     digit_sensor = res.digit_sensor_idx
     didx = res.photon_digit_idx
     if not keep.all():
@@ -629,6 +882,7 @@ def digitize_and_decompose(
         digit_sensor = digit_sensor[keep]
         pe_reco = pe_reco[keep]
         t_reco_digit = t_reco_digit[keep]
+    pe_reco = apply_charge_precision(pe_reco, model)
 
     sensor_digits = {
         "sensor_idx": digit_sensor.astype(np.uint16),
@@ -703,3 +957,113 @@ def generate_dark_noise(
     times = rng.uniform(t_start_ns, t_end_ns, size=total)
     charges = np.full(total, float(charge_pe), dtype=np.float64)
     return sensor_idx, times, charges
+
+
+# --- Pulsed sources (calibration) --------------------------------------------
+# A calibration pulse puts a sensor's photoelectrons into one integration window, so its prompt
+# light is one digit; dark pulses spread over a readout far longer than the window are digits of
+# their own. Neither function below models the dead time (a dark pulse vetoing later light, ~rate
+# x deadtime ~0.3% for HK) or light arriving later than the window after the first photoelectron.
+
+
+def digit_charge_moments(
+    model: dict, n_max: int, n_draws: int = 50_000, rng: Optional[np.random.Generator] = None
+):
+    """Moments of one digit's recorded charge given ``n`` photoelectrons, ``n = 0..n_max``.
+
+    The digit goes through this model's readout: the SPE charge sum (:func:`_sample_spe_charge`),
+    the discriminator (fires with :func:`discriminator_efficiency`, taken in expectation rather than
+    drawn) and the charge precision (:func:`apply_charge_precision`); a digit that does not fire
+    records 0. Returns ``(p_fire, mean, second_moment)``, each ``(n_max + 1,)``.
+    """
+    if model.get("charge_model") != "spe":
+        raise ValueError(f"digitizer model {model.get('model')!r} has no SPE charge response")
+    rng = np.random.default_rng(0) if rng is None else rng
+    p_fire = np.zeros(n_max + 1)
+    mean = np.zeros(n_max + 1)
+    second = np.zeros(n_max + 1)
+    for n in range(1, n_max + 1):
+        q = _sample_spe_charge(np.full(n_draws, float(n)), model["spe"], rng)
+        eff = discriminator_efficiency(q, model)
+        qr = np.asarray(apply_charge_precision(q, model), dtype=np.float64)
+        p_fire[n], mean[n], second[n] = eff.mean(), (eff * qr).mean(), (eff * qr**2).mean()
+    return p_fire, mean, second
+
+
+def pulse_charge_response(
+    model: dict,
+    mu,
+    dark_mu: float = 0.0,
+    n_draws: int = 50_000,
+    rng: Optional[np.random.Generator] = None,
+):
+    """Mean and variance of a sensor's recorded charge in one pulse, and its prompt-digit
+    probability, at ``mu`` expected photoelectrons per pulse plus ``dark_mu`` dark pulses.
+
+    Prompt light: Poisson(``mu``) photoelectrons in one digit (:func:`digit_charge_moments`).
+    Dark: Poisson(``dark_mu``) single-photoelectron digits, independent of it. Returns
+    ``(mean, var, p_hit)`` on ``mu``'s shape; smooth in ``mu`` though every stage is a hard cut.
+    """
+    from scipy.stats import poisson
+
+    mu = np.asarray(mu, dtype=np.float64)
+    top = float(mu.max(initial=0.0))
+    n_max = int(np.ceil(top + 10.0 * np.sqrt(top) + 10.0))
+    p1, m1, m2 = digit_charge_moments(model, n_max, n_draws, rng)
+    w = poisson.pmf(np.arange(n_max + 1), mu.reshape(-1, 1))
+    mean, second, p_hit = w @ m1, w @ m2, w @ p1
+    var = second - mean**2 + dark_mu * m2[1]
+    mean = mean + dark_mu * m1[1]
+    return mean.reshape(mu.shape), var.reshape(mu.shape), p_hit.reshape(mu.shape)
+
+
+def sample_pulse_charge_sums(
+    mu,
+    n_pulses: int,
+    model: dict,
+    rng: np.random.Generator,
+    dark_mu: float = 0.0,
+    max_draws: int = 20_000_000,
+):
+    """Per-sensor sum and sum of squares of recorded charge over ``n_pulses`` pulses.
+
+    Each pulse gives sensor ``i`` Poisson(``mu[i]``) photoelectrons in one digit, through this
+    model's readout as :func:`digit_charge_moments` describes (the discriminator drawn), and
+    Poisson(``dark_mu``) single-photoelectron dark digits. Only pulses that put light on a sensor
+    are drawn. The sum of squares treats a pulse's prompt and dark digits as separate pulses,
+    leaving out their cross term: the per-pulse variance it implies is low by
+    ``2 x prompt mean x dark mean``, ~1% at 10 p.e. per pulse for HK and negligible below 1.
+    """
+    from scipy.stats import poisson
+
+    mu = np.asarray(mu, dtype=np.float64)
+    ns = mu.shape[0]
+    total = np.zeros(ns)
+    total_sq = np.zeros(ns)
+
+    def digits(sensor, n):
+        q = _sample_spe_charge(n, model["spe"], rng)
+        fire = rng.random(q.shape) < discriminator_efficiency(q, model)
+        q = np.where(fire, np.asarray(apply_charge_precision(q, model), dtype=np.float64), 0.0)
+        total[:] += np.bincount(sensor, weights=q, minlength=ns)
+        total_sq[:] += np.bincount(sensor, weights=q**2, minlength=ns)
+
+    p0 = np.exp(-mu)
+    lit = rng.binomial(n_pulses, 1.0 - p0)  # pulses with prompt light, per sensor
+    dark = rng.poisson(n_pulses * dark_mu, size=ns)  # dark digits, per sensor
+    for counts, prompt in ((lit, True), (dark, False)):
+        bounds = np.concatenate([[0], np.cumsum(counts)])
+        start = 0
+        while start < ns:  # sensor chunks of <= max_draws digits
+            stop = int(np.searchsorted(bounds, bounds[start] + max_draws, side="right")) - 1
+            stop = max(stop, start + 1)
+            sensor = np.repeat(np.arange(start, stop), counts[start:stop])
+            if sensor.size:
+                if prompt:  # n | n >= 1, by inverse CDF
+                    u = rng.uniform(p0[sensor], 1.0)
+                    n = np.maximum(poisson.ppf(u, mu[sensor]), 1.0)
+                else:
+                    n = np.ones(sensor.size)
+                digits(sensor, n)
+            start = stop
+    return total, total_sq

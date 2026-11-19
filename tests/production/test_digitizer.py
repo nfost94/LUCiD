@@ -471,3 +471,71 @@ def test_resolve_first_detection_tags_only_detected_photons():
         threshold=1e-10,
     )
     assert not bool(none_dev.any())
+
+
+# --- WCSim's discriminator and charge precision (ski_wcsim / hk_wcsim) ------------------------
+
+
+def test_wcsim_presets_are_ski_and_hk_with_wcsims_discriminator():
+    """ski_wcsim / hk_wcsim differ from ski / hk only in the discriminator (and hk's SPE fit)."""
+    for base in ("ski", "hk"):
+        a, b = MODEL_PRESETS[base], MODEL_PRESETS[f"{base}_wcsim"]
+        assert a["threshold_pe"] == 0.25 and a["threshold_curve"] is None
+        assert b["threshold_curve"] is not None
+        same = set(a) - {"threshold_pe", "threshold_curve", "spe"}
+        assert all(a[k] == b[k] for k in same)
+    assert MODEL_PRESETS["ski_wcsim"]["spe"] == MODEL_PRESETS["ski"]["spe"]
+
+
+def test_wcsim_discriminator_is_wcsims_threshold_curve():
+    """WCSimWCDigitizerSKI::Threshold on the raw SPE-table charge: 11.4% at 0.1 p.e.,
+    53.7% at 0.25, 82.5% at 0.5, certain from 1 p.e. (values of WCSim's polynomial)."""
+    from lucid.simulation.digitizer import apply_discriminator, discriminator_efficiency
+
+    for name in ("ski_wcsim", "hk_wcsim"):
+        model = resolve_model_config(name)
+        raw = np.array([0.1, 0.25, 0.5, 1.0, 3.0])
+        eff = discriminator_efficiency(raw / model["spe"]["fit_mean"], model)
+        np.testing.assert_allclose(eff, [0.114, 0.537, 0.825, 1.0, 1.0], atol=1e-3)
+        # the draw fires at that rate
+        fired = apply_discriminator(
+            np.full(200_000, 0.25 / model["spe"]["fit_mean"]), model, _rng()
+        )
+        assert abs(fired.mean() - 0.537) < 0.005
+    try:
+        apply_discriminator(np.array([0.5]), resolve_model_config("hk_wcsim"))  # needs an rng
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+def test_charge_precision_truncates_after_the_discriminator():
+    """WCSim's AddNewDigit: charge toward zero in steps of PEPrecision; digits
+    below one step are kept, with charge 0. Step 0 (every preset) leaves charge alone."""
+    from lucid.simulation.digitizer import apply_charge_precision
+
+    q = np.array([0.1, 0.31, 0.95, 2.0], dtype=np.float32)
+    np.testing.assert_allclose(
+        apply_charge_precision(q, {"pe_precision": 0.3}), [0.0, 0.3, 0.9, 1.8], atol=1e-6
+    )
+    for name in MODEL_PRESETS:
+        np.testing.assert_array_equal(apply_charge_precision(q, resolve_model_config(name)), q)
+
+    rng = _rng()
+    n = 2000
+    model = resolve_model_config({"model": "hk_wcsim", "pe_precision": 0.3})
+    sd, _, _ = digitize_and_decompose(
+        sensor_idx=rng.integers(0, 3000, size=n),
+        charge=np.ones(n),
+        t_true=np.zeros(n),
+        t_reco=np.zeros(n),
+        particle_idx=np.zeros(n, np.int64),
+        segment_idx=np.zeros(n, np.int64),
+        emission_process=np.zeros(n, np.int64),
+        n_sensors=3000,
+        model=model,
+        rng=rng,
+    )
+    steps = sd["PE"] / 0.3
+    np.testing.assert_allclose(steps, np.round(steps), atol=1e-4)
+    assert (sd["PE"] == 0).any()  # sub-step digits survive with Q = 0

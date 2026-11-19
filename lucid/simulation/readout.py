@@ -17,20 +17,33 @@ import numpy as np
 
 from lucid.dataset.schema import EMISSION_PROCESS_DARK
 from lucid.simulation.digitizer import resolve_model_config
-from lucid.simulation.trigger import TriggerConfig, apply_trigger
+from lucid.simulation.trigger import HKTrigger, TriggerConfig, apply_trigger, trigger_from_block
 
 __all__ = ["Readout"]
 
 # Keys `TriggerConfig.from_block` understands. It silently drops anything else, so
 # `"n_threshold": 45` instead of `"n_thr": 45` ran the default n_thr=30 and the only trace was
-# the gate count; `Readout.from_blocks` refuses such a block instead.
+# the gate count; `Readout.from_blocks` refuses such a block instead. ``"model"`` selects the
+# trigger (``"hk"``: :class:`~lucid.simulation.trigger.HKTrigger`, with its own keys).
 _TRIGGER_BLOCK_KEYS = frozenset(
     {
+        "model",
         "window_ns",
         "n_thr",
         "pad_before_ns",
         "pad_after_ns",
         "pad_ns",
+    }
+)
+_HK_TRIGGER_BLOCK_KEYS = frozenset(
+    {
+        "model",
+        "threshold",
+        "window_ns",
+        "pad_before_ns",
+        "pad_after_ns",
+        "noise_dark_rate_khz",
+        "n_pmts",
     }
 )
 
@@ -58,16 +71,17 @@ def _strict_trigger_block(block):
         return None
     if not isinstance(block, dict):
         raise ValueError(f"trigger block must be a dict or None, got {type(block).__name__}")
-    unknown = [k for k in block if k not in _TRIGGER_BLOCK_KEYS and not str(k).startswith("_")]
+    valid = _HK_TRIGGER_BLOCK_KEYS if block.get("model") == "hk" else _TRIGGER_BLOCK_KEYS
+    unknown = [k for k in block if k not in valid and not str(k).startswith("_")]
     if unknown:
         parts = []
         for k in sorted(unknown):
-            near = difflib.get_close_matches(str(k), sorted(_TRIGGER_BLOCK_KEYS), n=1)
+            near = difflib.get_close_matches(str(k), sorted(valid), n=1)
             parts.append(f"{k!r}" + (f" (did you mean {near[0]!r}?)" if near else ""))
         raise ValueError(
             "unknown key(s) in the trigger block: "
             + ", ".join(parts)
-            + f"; valid keys are {sorted(_TRIGGER_BLOCK_KEYS)}"
+            + f"; valid keys are {sorted(valid)}"
         )
     return block
 
@@ -119,15 +133,16 @@ class Readout:
     ----------
     digitizer : dict
         The resolved digitizer model (:func:`lucid.simulation.digitizer.resolve_model_config`).
-    trigger : TriggerConfig or None
-        The sliding-window trigger; ``None`` reads out everything.
+    trigger : TriggerConfig, HKTrigger or None
+        The sliding-window trigger, or the HK (WCSim NDigits) trigger; ``None`` reads out
+        everything.
     min_physics_hits : int or None
         When set, the trigger-free truth selection replaces the trigger: an event is kept as one
         window iff it has at least this many physics digits.
     """
 
     digitizer: dict
-    trigger: TriggerConfig | None = None
+    trigger: TriggerConfig | HKTrigger | None = None
     min_physics_hits: int | None = None
 
     def __post_init__(self):
@@ -145,7 +160,7 @@ class Readout:
         block (``None`` = off; unknown keys raise) and the selection threshold."""
         return cls(
             resolve_model_config(digitizer),
-            TriggerConfig.from_block(_strict_trigger_block(trigger)),
+            trigger_from_block(_strict_trigger_block(trigger)),
             min_physics_hits,
         )
 
@@ -184,7 +199,7 @@ class Readout:
             out["trigger"] = "none"
         else:
             out.update(
-                trigger="sliding_window",
+                trigger=self.trigger.name,
                 trigger_window_ns=float(self.trigger.window_ns),
                 trigger_n_thr=int(self.trigger.n_thr),
                 trigger_pad_before_ns=float(self.trigger.pad_before_ns),
