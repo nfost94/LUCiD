@@ -200,6 +200,7 @@ def photon_iteration_update_factors(
     rng_key,
     speed_of_light,
     reflection_fn=scalar_reflection,
+    independent_sensor_detection=False,
 ):
     """
     Expected-value ("implicit capture") photon update with DiCE score-function gradients.
@@ -339,7 +340,11 @@ def photon_iteration_update_factors(
     refl_sensor = jnp.where(
         hit_sensor, refl_prob, reflection_fn(direction, normal, True, refl_params, lam, k[5])[0]
     )
-    detect_prob = reach * (1.0 - refl_sensor) * atten_surf
+    # The tabulated PMT models (reflection.INDEPENDENT_SENSOR_DETECTION_MODELS) make detection
+    # independent of reflection: the hits apply A(theta) per candidate PMT, so the deposit carries
+    # no (1 - R) factor while the weight R continues.
+    deposit_factor = 1.0 if independent_sensor_detection else 1.0 - refl_sensor
+    detect_prob = reach * deposit_factor * atten_surf
     reflection_attenuation = jnp.ones_like(detect_prob)  # folded into detect_prob
     continuing_factor = jnp.where(is_scat, atten, refl_prob * atten)
 
@@ -374,8 +379,11 @@ def photon_iteration_update_factors(
 # a new reflection model never reshapes _fwd/_bwd residuals or cotangents.
 
 
-def make_photon_iteration_update_factors_safe(reflection_fn=scalar_reflection):
-    """Build the expected-value step closed over ``reflection_fn`` (a static model choice).
+def make_photon_iteration_update_factors_safe(
+    reflection_fn=scalar_reflection, independent_sensor_detection=False
+):
+    """Build the expected-value step closed over ``reflection_fn`` (a static model choice) and
+    ``independent_sensor_detection`` (see :func:`photon_iteration_update_factors`).
 
     Historically this wrapped the step in a ``jax.custom_vjp`` whose backward scrubbed
     NaN/Inf cotangents — a backstop for a sqrt-at-zero 0/0 in the surface-distance norm
@@ -422,6 +430,7 @@ def make_photon_iteration_update_factors_safe(reflection_fn=scalar_reflection):
             rng_key,
             speed_of_light,
             reflection_fn=reflection_fn,
+            independent_sensor_detection=independent_sensor_detection,
         )
 
     return _step

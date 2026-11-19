@@ -21,7 +21,15 @@ from lucid.simulation.photon_step import (
     make_photon_iteration_update_factors_safe,
     photon_iteration_sample,
 )
-from lucid.simulation.reflection import get_reflection_model, sensor_normal_reflectance
+from lucid.simulation.pmt_detection import (
+    TabulatedPmtDetectionResponse,
+    load_pmt_detection_response,
+)
+from lucid.simulation.reflection import (
+    INDEPENDENT_SENSOR_DETECTION_MODELS,
+    get_reflection_model,
+    sensor_normal_reflectance,
+)
 from lucid.siren.emitter import Emitter, load_emitter
 from lucid.sources.siren_rays import (
     make_cherenkov_surrogate_fn,
@@ -82,6 +90,11 @@ class _Optics:
     wavelength_sampling: str  # 'cherenkov' or 'cherenkov_qe'
     qe_sampler: Optional[Callable]  # 'cherenkov_qe' only
     mean_qe_c: Optional[float]  # 'cherenkov_qe' only
+    # The photons' speed (m/ns): ``fixed_speed`` when set (``propagation_speed_m_per_ns``), else
+    # the medium's group velocity at each photon's λ in wavelength mode and ``speed_of_light``
+    # (the medium's phase speed) in scalar mode.
+    speed_of_light: float
+    fixed_speed: Optional[float]
 
 
 @dataclass(frozen=True, eq=False)
@@ -100,6 +113,12 @@ class _Transport:
     K: int
     detach_directions: bool  # given photons: no gradient through the sampled directions
     is_volume: bool  # string telescope: the volume step, no reflection
+    # The tabulated PMT detection A(theta) (pmt_detection_model), or None. With a reflection
+    # model in INDEPENDENT_SENSOR_DETECTION_MODELS, detection is independent of reflection:
+    # the deposit carries no (1 - R), and a sampled photon's deposit converts at D / (1 - R).
+    pmt_detection: Optional[TabulatedPmtDetectionResponse] = None
+    independent_detection: bool = False
+    sampled_independent_detection: bool = False
 
 
 @dataclass(frozen=True, eq=False)
@@ -184,7 +203,14 @@ _TRANSPORTS = ("expected", "sampled")
 
 
 def _build_optics(
-    medium, wavelength_mode, wavelength_sampling, qe_curve, cherenkov_emission_band, given_photons
+    medium,
+    wavelength_mode,
+    wavelength_sampling,
+    qe_curve,
+    cherenkov_emission_band,
+    given_photons,
+    speed_of_light,
+    fixed_speed=None,
 ):
     """The :class:`_Optics` for these options, validated (see :func:`setup_event_simulator`).
 
@@ -286,6 +312,8 @@ def _build_optics(
         wavelength_sampling=wavelength_sampling,
         qe_sampler=qe_sampler,
         mean_qe_c=mean_qe_c,
+        speed_of_light=float(speed_of_light),
+        fixed_speed=None if fixed_speed is None else float(fixed_speed),
     )
 
 
@@ -320,8 +348,9 @@ def _get_optical_arrays(optics, n, detector_params, key, wavelengths=None):
     When wavelength_mode=True: uses medium coefficients at given wavelengths.
     When wavelength_mode=False: broadcasts DetectorParams scalars.
 
-    Returns (scatter_lengths, absorption_lengths, qe_weights, key).
-    qe_weights is (n,) relative to the QE at λ_ref (see _Optics.qe_ref), or None.
+    Returns (scatter_lengths, mie_lengths, absorption_lengths, qe_weights, speeds, key).
+    qe_weights is (n,) relative to the QE at λ_ref (see _Optics.qe_ref), or None; speeds is (n,)
+    m/ns (see _Optics.fixed_speed).
     """
     if optics.wavelength_mode and optics.medium_wl is None:
         raise RuntimeError(
@@ -332,7 +361,8 @@ def _get_optical_arrays(optics, n, detector_params, key, wavelengths=None):
         # Monochromatic / scalar mode: the pure optical model broadcasts the
         # DetectorParams scalars (wavelengths=None path).
         oa = evaluate_optical_model(detector_params, None, optics.medium_wl, n)
-        return (oa.scatter_len, oa.mie_len, oa.abs_len, oa.qe, key)
+        speed = optics.speed_of_light if optics.fixed_speed is None else optics.fixed_speed
+        return (oa.scatter_len, oa.mie_len, oa.abs_len, oa.qe, jnp.full(n, speed), key)
 
     # --- λ sampling (a SOURCE concern; the optical model only evaluates) ---
     # Normalize wavelength input to per-photon array:
@@ -372,7 +402,8 @@ def _get_optical_arrays(optics, n, detector_params, key, wavelengths=None):
     qe_weights = jnp.full(n, optics.mean_qe_c) if sampled_via_qe_importance else oa.qe
     if qe_weights is not None:
         qe_weights = qe_weights / optics.qe_ref
-    return oa.scatter_len, oa.mie_len, oa.abs_len, qe_weights, key
+    speeds = oa.propagation_speed if optics.fixed_speed is None else jnp.full(n, optics.fixed_speed)
+    return oa.scatter_len, oa.mie_len, oa.abs_len, qe_weights, speeds, key
 
 
 def _qe_per_photon(qe_weights, detector_params, n):
@@ -406,6 +437,7 @@ def _common_propagation(
     mie_scatter_lengths,
     absorption_lengths,
     qe_per_photon,
+    propagation_speeds,
     n_rays,
     detector_params,
     key,
@@ -427,6 +459,8 @@ def _common_propagation(
     qe_per_photon : jnp.ndarray
         Per-photon quantum efficiency for light arriving at a sensor, its reflection
         included, shape (n_rays,).
+    propagation_speeds : jnp.ndarray
+        Per-photon speed in m/ns (the group velocity, or a fixed speed), shape (n_rays,).
     """
 
     # Packed reflection params for the pluggable reflection model (default scalar_mix →
@@ -441,7 +475,9 @@ def _common_propagation(
     # incidence. The photon step reflects first and deposits the rest, so a deposited
     # photon converts at QE / (1 - R0), R0 the model's sensor reflectance at normal
     # incidence. String telescopes have no reflection.
-    if not t.is_volume:
+    # The tabulated PMT models define detection independently of reflection (A(theta) per
+    # candidate PMT), so their QE needs no such conversion.
+    if not t.is_volume and not t.independent_detection:
         qe_per_photon = qe_per_photon / (
             1.0 - sensor_normal_reflectance(t.reflection_fn, refl_params, refl_lam)
         )
@@ -530,7 +566,13 @@ def _common_propagation(
             )
             # Same 4-tuple shape as the surface branch: the scan unpacks one
             # output signature for both models.
-            outputs = (updated_weights, sensor_indices, total_times.squeeze(-1), step_indirect)
+            outputs = (
+                updated_weights,
+                sensor_indices,
+                total_times.squeeze(-1),
+                jnp.ones_like(updated_weights),
+                step_indirect,
+            )
             return new_state, outputs
 
         # ── Surface model (cylinder/sphere/box) — UNCHANGED, byte-identical ──
@@ -552,6 +594,29 @@ def _common_propagation(
         key, subkey = jax.random.split(key)
         rng_keys = jax.random.split(subkey, n_rays)
 
+        # The tabulated PMT detection A(theta), per candidate deposit, at the local incidence on
+        # the PMT's curved surface: the propagator's sensor normals are outward, as is a ray
+        # arriving at a PMT, so their dot product is the incidence cosine.
+        if t.pmt_detection is None:
+            pmt_factor = jnp.ones_like(depositions)
+        else:
+            ray_dirs = state.directions / (
+                jnp.linalg.norm(state.directions, axis=1, keepdims=True) + 1e-12
+            )
+            local_cos = jnp.clip(
+                jnp.sum(prop_results["sensor_normals"] * ray_dirs[None, :, :], axis=-1), 0.0, 1.0
+            )
+            pmt_factor = jnp.where(sensor_indices >= 0, t.pmt_detection.factor(local_cos), 1.0)
+        if t.sampled_independent_detection:
+            # A sampled photon that reaches a PMT reflects with R(theta) or is deposited, and the
+            # deposit converts at qe * A(theta) (the hits). With detection D independent of R, the
+            # deposit converts at D / (1 - R): detected with probability D, lost in the PMT with
+            # 1 - R - D. R is the one the photon step evaluates, at the same direction and normal.
+            sensor_reflectance = jax.vmap(
+                lambda d, n, h, k: t.reflection_fn(d, n, h, refl_params, refl_lam, k)[0]
+            )(state.directions, normals, hit_sensor, rng_keys)
+            pmt_factor = pmt_factor / jnp.maximum(1.0 - sensor_reflectance, 1e-3)[None, :]
+
         # vmap: 14 args — per-photon scatter/absorption, scalar g, packed refl_params
         # pytree (broadcast, in_axes None), per-photon hit_sensor + rng, scalar lam
         # (a wavelength placeholder for scalar reflection; per-photon λ is threaded when
@@ -568,7 +633,7 @@ def _common_propagation(
             logp_increments,
             step_indirect,
         ) = jax.vmap(
-            t.photon_update_fn, in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, 0, 0, None, 0, None)
+            t.photon_update_fn, in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, 0, 0, None, 0, 0)
         )(
             state.positions,
             state.directions,
@@ -583,7 +648,7 @@ def _common_propagation(
             hit_sensor,
             refl_lam,
             rng_keys,
-            t.speed_of_light,
+            propagation_speeds,
         )
 
         inside_detector = t.bounds_check(new_positions)
@@ -598,7 +663,7 @@ def _common_propagation(
         dice_dep = jnp.exp(state.log_p - jax.lax.stop_gradient(state.log_p))  # (n_rays,)
         detected_factors = detect_probs * reflection_attenuations * dice_dep
         updated_weights = depositions * physical_intensities[None, :] * detected_factors[None, :]
-        times_ns = hit_times_meters / t.speed_of_light
+        times_ns = hit_times_meters / propagation_speeds[:, None]
         total_times = times_ns + state.times[:, None]
 
         iter_weights = updated_weights
@@ -622,7 +687,7 @@ def _common_propagation(
         # gradient path exactly as they were. A cumulative OR along the
         # iteration axis afterwards gives "had already indirect", which is
         # what the scattering table's direct/indirect split needs.
-        outputs = (iter_weights, iter_indices, iter_times, step_indirect)
+        outputs = (iter_weights, iter_indices, iter_times, pmt_factor, step_indirect)
         return new_state, outputs
 
     init_state = PhotonState(
@@ -635,7 +700,7 @@ def _common_propagation(
     )
     propagation_step_remat = jax.remat(propagation_step)
 
-    _, (all_weights, all_indices, all_times, all_indirect) = jax.lax.scan(
+    _, (all_weights, all_indices, all_times, all_pmt_factors, all_indirect) = jax.lax.scan(
         propagation_step_remat, init_state, jnp.arange(t.K)
     )
 
@@ -662,7 +727,9 @@ def _common_propagation(
     # all_weights shape: (K, max_candidates_per_ray, n_rays), C-order reshape
     # → photon index is i % n_rays
     photon_idx = jnp.arange(flat_weights.shape[0]) % n_rays
-    flat_qe = qe_per_photon[photon_idx]
+    # The PMT detection factor is relative to the QE and may exceed one; a sampled detection clips
+    # the probability it makes.
+    flat_qe = qe_per_photon[photon_idx] * jnp.maximum(all_pmt_factors.reshape(-1), 0.0)
 
     key, qe_key = jax.random.split(key)
     # Per-photon segment id (segment_truth hits), broadcast to flat shape via the
@@ -700,8 +767,8 @@ def _simulation_with_data_impl(f, detector_params, key, photon_data):
 
     # Per-photon optical properties — use PhotonSim wavelengths if available
     data_wavelengths = photon_data.get("wavelengths", None)
-    scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, key = _get_optical_arrays(
-        f.optics, n_rays, detector_params, key, wavelengths=data_wavelengths
+    scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, speeds, key = (
+        _get_optical_arrays(f.optics, n_rays, detector_params, key, wavelengths=data_wavelengths)
     )
     qe_per_photon = _qe_per_photon(qe_weights, detector_params, n_rays)
 
@@ -722,6 +789,7 @@ def _simulation_with_data_impl(f, detector_params, key, photon_data):
         mie_scatter_lengths,
         absorption_lengths,
         qe_per_photon,
+        speeds,
         n_rays,
         detector_params,
         key,
@@ -802,7 +870,7 @@ def _simulation_without_data_impl(
         photon_times = particle_params.t0 + jnp.concatenate(parts_times)
         wavelengths = jnp.concatenate(parts_wls)
 
-        scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, key = (
+        scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, speeds, key = (
             _get_optical_arrays(optics, n_total, detector_params, opt_key, wavelengths=wavelengths)
         )
         qe_per_photon = _qe_per_photon(qe_weights, detector_params, n_total)
@@ -815,6 +883,7 @@ def _simulation_without_data_impl(
             mie_scatter_lengths,
             absorption_lengths,
             qe_per_photon,
+            speeds,
             n_total,
             detector_params,
             key,
@@ -835,8 +904,8 @@ def _simulation_without_data_impl(
     t0 = jax.lax.stop_gradient(_pt0(distances_to_vertex))
 
     # Per-photon optical properties (Cherenkov spectrum when wavelength_mode)
-    scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, key = _get_optical_arrays(
-        optics, n_photons, detector_params, opt_key
+    scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, speeds, key = (
+        _get_optical_arrays(optics, n_photons, detector_params, opt_key)
     )
     qe_per_photon = _qe_per_photon(qe_weights, detector_params, n_photons)
 
@@ -849,6 +918,7 @@ def _simulation_without_data_impl(
         mie_scatter_lengths,
         absorption_lengths,
         qe_per_photon,
+        speeds,
         n_photons,
         detector_params,
         key,
@@ -868,8 +938,8 @@ def _simulation_sensor_calibration_impl(f, source, detector_params, key):
     # Source wavelength can be None (→ Cherenkov), scalar, or (Nphot,) array;
     # _get_optical_arrays normalizes the shape.
     wavelengths = getattr(source, "wavelength", None)
-    scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, key = _get_optical_arrays(
-        f.optics, n_photons, detector_params, opt_key, wavelengths=wavelengths
+    scatter_lengths, mie_scatter_lengths, absorption_lengths, qe_weights, speeds, key = (
+        _get_optical_arrays(f.optics, n_photons, detector_params, opt_key, wavelengths=wavelengths)
     )
     qe_per_photon = _qe_per_photon(qe_weights, detector_params, n_photons)
 
@@ -882,6 +952,7 @@ def _simulation_sensor_calibration_impl(f, source, detector_params, key):
         mie_scatter_lengths,
         absorption_lengths,
         qe_per_photon,
+        speeds,
         n_photons,
         detector_params,
         key,
@@ -997,6 +1068,8 @@ def setup_event_simulator(
     reflection_wavelength=400.0,
     cherenkov_emission_band=None,
     emission_processes=None,
+    pmt_detection_model=None,
+    propagation_speed_m_per_ns=None,
     **grid_params,
 ):
     """
@@ -1105,6 +1178,16 @@ def setup_event_simulator(
         None (default) runs the material's own processes (``materials/<material>.json``); a tuple
         overrides them, e.g. to predict one process alone. With both, the photon budget splits by
         the material's ``cherenkov_fraction``.
+    pmt_detection_model : TabulatedPmtDetectionResponse, path-like or None
+        A local-incidence detection response for curved PMTs (``sensor_shape='hk50cm'``): the
+        QE is multiplied by the table at the cosine between the arriving ray and the PMT's
+        surface normal. Relative to the QE, so it may exceed one; a sampled detection clips the
+        final probability. Required by the tabulated reflection models
+        (``reflection.INDEPENDENT_SENSOR_DETECTION_MODELS``), whose detection is independent of
+        their reflection. None: no such factor.
+    propagation_speed_m_per_ns : float or None
+        A fixed photon speed (m/ns), in place of the medium's group velocity at each photon's λ
+        (wavelength mode) or its phase speed (scalar mode).
 
     Returns
     -------
@@ -1184,6 +1267,32 @@ def setup_event_simulator(
     n_medium = float(det_geom.medium.refractive_index)  # sources and the cathode's first interface
     reflection_fn, build_refl_params = get_reflection_model(reflection_model, n_medium=n_medium)
 
+    # ---- Tabulated PMT detection ------------------------------------------------
+    if pmt_detection_model is None or isinstance(
+        pmt_detection_model, TabulatedPmtDetectionResponse
+    ):
+        pmt_detection = pmt_detection_model
+    else:
+        pmt_detection = load_pmt_detection_response(pmt_detection_model)
+    if pmt_detection is not None:
+        if is_volume:
+            raise ValueError("pmt_detection_model is only supported for surface detectors")
+        if det_geom.sensor_shape != "hk50cm":
+            raise ValueError(
+                "pmt_detection_model needs a curved PMT surface (sensor_shape='hk50cm') to "
+                f"evaluate its incidence; this detector's is {det_geom.sensor_shape!r}"
+            )
+    independent_detection = reflection_model in INDEPENDENT_SENSOR_DETECTION_MODELS
+    if independent_detection and pmt_detection is None:
+        raise ValueError(
+            f"reflection_model={reflection_model!r} needs pmt_detection_model: its A(theta) "
+            "supplies the detection, independent of the reflection R(theta)"
+        )
+    if propagation_speed_m_per_ns is not None and not (
+        float(propagation_speed_m_per_ns) > 0.0 and float(propagation_speed_m_per_ns) < float("inf")
+    ):
+        raise ValueError("propagation_speed_m_per_ns must be finite and positive")
+
     # ---- Select photon update function --------------------------------------
     # Both paths get the SAME reflection model. The sampling path (given photons / sampled
     # truth) previously hard-coded scalar reflection, which silently desynced it from the
@@ -1192,7 +1301,11 @@ def setup_event_simulator(
     if transport == "sampled":
         photon_update_fn = partial(photon_iteration_sample, reflection_fn=reflection_fn)
     else:
-        photon_update_fn = jax.remat(make_photon_iteration_update_factors_safe(reflection_fn))
+        photon_update_fn = jax.remat(
+            make_photon_iteration_update_factors_safe(
+                reflection_fn, independent_sensor_detection=independent_detection
+            )
+        )
 
     has_cherenkov, has_scintillation, n_cher, n_scint = _emission_split(
         det_geom.medium, n_photons, wavelength_mode
@@ -1215,8 +1328,10 @@ def setup_event_simulator(
         qe_curve,
         cherenkov_emission_band,
         given_photons,
+        det_geom.speed_of_light,
+        propagation_speed_m_per_ns,
     )
-    if default_dp is not None and not is_volume:
+    if default_dp is not None and not is_volume and not independent_detection:
         _check_peak_qe(
             default_dp,
             reflection_fn,
@@ -1239,6 +1354,9 @@ def setup_event_simulator(
         K=K,
         detach_directions=given_photons,
         is_volume=is_volume,
+        pmt_detection=pmt_detection,
+        independent_detection=independent_detection,
+        sampled_independent_detection=independent_detection and transport == "sampled",
     )
     forward = _Forward(
         propagate=jax.jit(partial(_common_propagation, transport), static_argnames=("n_rays",)),

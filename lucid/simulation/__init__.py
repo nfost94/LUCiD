@@ -33,6 +33,11 @@ from lucid.simulation.optics import (
     solve_rayleigh_inverse_cdf,
 )
 from lucid.simulation.photon_step import photon_iteration_sample, photon_iteration_update_factors
+from lucid.simulation.pmt_detection import (
+    TabulatedPmtDetectionResponse,
+    load_pmt_detection_response,
+    make_tabulated_pmt_detection_response,
+)
 from lucid.simulation.simulator import setup_event_simulator
 from lucid.simulation.types import PhotonState
 
@@ -60,5 +65,8 @@ __all__ = [
     "waveform_expected",
     "waveform_sampled",
     "photon_hits_sampled",
+    "TabulatedPmtDetectionResponse",
+    "load_pmt_detection_response",
+    "make_tabulated_pmt_detection_response",
     "PhotonState",
 ]

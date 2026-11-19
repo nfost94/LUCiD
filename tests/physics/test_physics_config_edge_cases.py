@@ -22,6 +22,7 @@ from lucid.detector_params import (
     load_detector_params,
     load_physics_config,
 )
+from lucid.wavelength.medium import load_qe_curve
 from tests.helpers.paths import REPO
 
 CONFIG_DIR = os.path.join(str(REPO), "config")
@@ -335,6 +336,36 @@ def test_qe_curve_path(det_name, loaded_configs):
         assert 0.0 < qe_400 < 1.0, f"{det_name} QE at 400nm = {qe_400}, expected 0 < QE < 1"
     else:
         assert qe_curve is None, det_name
+
+
+def test_user_supplied_qe_table_is_replaceable(tmp_path):
+    # Invented values exercise table input; these are not detector calibration data.
+    path = tmp_path / "synthetic_qe.json"
+    path.write_text(
+        json.dumps(
+            {
+                "wavelengths_nm": [300.0, 400.0, 500.0],
+                "qe_percent": [10.0, 20.0, 10.0],
+            }
+        )
+    )
+    wavelengths = jnp.array([250.0, 300.0, 350.0, 400.0, 450.0, 500.0, 550.0])
+    qe = load_qe_curve(path)
+    expected = jnp.array([0.0, 0.10, 0.15, 0.20, 0.15, 0.10, 0.0])
+    assert jnp.allclose(qe(wavelengths), expected, rtol=1e-6, atol=1e-7)
+
+    replacement_path = tmp_path / "replacement_qe.json"
+    replacement_path.write_text(
+        json.dumps(
+            {
+                "wavelengths_nm": [300.0, 500.0],
+                "qe_percent": [30.0, 30.0],
+            }
+        )
+    )
+    replacement = load_qe_curve(replacement_path)
+    assert float(replacement(400.0)) == pytest.approx(0.30)
+    assert float(qe(400.0)) == pytest.approx(0.20)
 
 
 # ---------------------------------------------------------------------------
