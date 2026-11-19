@@ -426,8 +426,10 @@ def create_propagator(detector, sensor_positions, sensor_radius,
         Candidate-sensor geometry (the PMT type). ``'sphere'`` and ``'hk50cm'`` are each the cap of
         a sphere standing on the wall, aperture radius r and height h: a sphere of radius
         (h^2 + r^2) / (2h) centred (r^2 - h^2) / (2h) behind the aperture. ``'sphere'`` is the
-        hemisphere, h = r. ``'hk50cm'`` is the HK Box&Line, r = 0.254 m and h = 0.18 m
-        (:mod:`lucid.propagation.hk_pmt_geometry`); ``sensor_radius`` must be its aperture.
+        hemisphere, h = r, whose soft overlap stays the free sphere's disc from every direction.
+        ``'hk50cm'`` is the HK Box&Line, r = 0.254 m and h = 0.18 m, whose soft overlap is the cap's
+        silhouette at the line's incidence (:mod:`lucid.propagation.hk_pmt_geometry`);
+        ``sensor_radius`` must be its aperture.
         ``'sk20inch'`` uses the measured PMT axes and SK-like sphere-plus-torus bulb shape.
     sk_pmt_lookup : SKPMTCoverageLookup or None
         Optional prebuilt smooth-coverage table, primarily for tests or reuse.
@@ -609,15 +611,18 @@ def create_propagator(detector, sensor_positions, sensor_radius,
     # 5. Overlap probability (shared)
     # temperature=None → step function (hard assignment, non-differentiable)
     # temperature=float → Gaussian kernel with sigma = temperature * sensor_radius
-    if sensor_shape in ('sphere', 'hk50cm'):
-        if temperature is None:
-            overlap_prob = create_overlap_prob(
-                None, sensor_radius, expose_height,
-                st_width_frac=overlap_st_width_frac, renorm=overlap_renorm, mode=overlap_mode)
-        else:
-            overlap_prob = create_overlap_prob(
-                temperature * sensor_radius, sensor_radius, expose_height,
-                st_width_frac=overlap_st_width_frac, renorm=overlap_renorm, mode=overlap_mode)
+    sigma = None if temperature is None else temperature * sensor_radius
+    if sensor_shape == 'sphere':
+        # The soft overlap is the free sphere's disc from every direction, as it has always been;
+        # the hard step is the hemisphere's, which is the free sphere's.
+        _free_overlap = create_overlap_prob(
+            sigma, sensor_radius, None,
+            st_width_frac=overlap_st_width_frac, renorm=overlap_renorm, mode=overlap_mode)
+        overlap_prob = lambda d, to_sensor, line_dir, axis: _free_overlap(d)
+    elif sensor_shape == 'hk50cm':
+        overlap_prob = create_overlap_prob(
+            sigma, sensor_radius, expose_height,
+            st_width_frac=overlap_st_width_frac, renorm=overlap_renorm, mode=overlap_mode)
     else:
         overlap_prob = None
 

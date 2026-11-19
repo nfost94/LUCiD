@@ -91,14 +91,12 @@ def test_setup_bounds_qe_by_the_non_reflected_fraction(beam):
         _simulator(default_detector_params=_params(det, 0.25, qe=0.8))
 
 
-def test_sk_independent_absorption_does_not_apply_reflection_correction_twice(tmp_path, monkeypatch):
+def _one_tabulated_pmt(tmp_path, monkeypatch):
+    """A synthetic curved PMT and optical table exercise the tabulated-PMT (SK) branch without collaboration-only detector inputs."""
     from lucid.geometry.cylinder import Cylinder
     from lucid.geometry import detector_geometry
-    from lucid.simulation import reflection, setup_event_simulator
+    from lucid.simulation import reflection
     from lucid.simulation.pmt_detection import make_tabulated_pmt_detection_response
-    from lucid.sources import laser_source
-    # A synthetic curved PMT and optical table exercise the SK absorption branch
-    # without collaboration-only detector inputs.
     path = tmp_path / "one_pmt.npz"
     np.savez(path, positions_mm=np.array([[1000.0, 0.0, 0.0]]),
              directions=np.array([[-1.0, 0.0, 0.0]]),
@@ -112,11 +110,50 @@ def test_sk_independent_absorption_does_not_apply_reflection_correction_twice(tm
         table, table, table, table, table))
     response = make_tabulated_pmt_detection_response(
         [0.0, 1.0], [1.0, 1.0], wavelength_nm=405)
-    sim = setup_event_simulator(
-        GEOM, 1024, temperature=None, K=1, is_calibration=True,
+    return det, response
+
+
+def _tabulated_simulator(response, n, **setup):
+    from lucid.simulation import setup_event_simulator
+    return setup_event_simulator(
+        GEOM, n, temperature=None, K=1, is_calibration=True,
         wavelength_mode=False, sensor_shape='sk20inch', max_candidates_per_ray=1,
-        reflection_model='tabulated_tuned', pmt_detection_model=response)
+        reflection_model='tabulated_tuned', pmt_detection_model=response, **setup)
+
+
+def test_sk_independent_absorption_does_not_apply_reflection_correction_twice(tmp_path, monkeypatch):
+    from lucid.sources import laser_source
+    det, response = _one_tabulated_pmt(tmp_path, monkeypatch)
+    sim = _tabulated_simulator(response, 1024)
     source = laser_source(position=[0.0, 0.0, 0.0], direction=[1.0, 0.0, 0.0],
                           intensity=1024, fiber_NA=1e-6)
     charge, _ = sim(source, _params(det, 0.25), jax.random.PRNGKey(3))
     np.testing.assert_allclose(float(jnp.sum(charge)), 1024 * QE, rtol=1e-3)
+
+
+def test_sampled_tabulated_pmt_detects_the_expected_charge(tmp_path, monkeypatch):
+    """A sampled photon at the tabulated PMT takes one fate: reflected (R), detected (QE x A(theta)), or lost in the PMT.
+
+    The expected-value step lets weight R continue and deposits QE x A(theta) from the same photon, so the sampled
+    detection probability must equal the expected charge per photon, QE, with the rest lost, not QE x (1 - R)."""
+    from lucid.sources import laser_source
+    det, response = _one_tabulated_pmt(tmp_path, monkeypatch)
+    sim = _tabulated_simulator(response, N, use_expected_value=False, hit_mode='realistic')
+    source = laser_source(position=[0.0, 0.0, 0.0], direction=[1.0, 0.0, 0.0],
+                          intensity=N, fiber_NA=1e-6)
+    five_sigma = 5 * np.sqrt(N * QE * (1 - QE))
+    for sensor_rate in (0.25, 0.5):          # the reflectance moves; the detection does not
+        charge, _ = sim(source, _params(det, sensor_rate), jax.random.PRNGKey(3))
+        assert abs(float(jnp.sum(charge)) - N * QE) < five_sigma, sensor_rate
+
+
+def test_first_hit_mode_returns_the_charge_the_waveform_and_the_hit_distribution(beam):
+    """hit_mode='first_hit' on the pencil beam: the charge is QE x photons, the waveform holds it, and the first-hit
+    distribution sums to the chance of a hit."""
+    det, target, source = beam
+    sim = _simulator(hit_mode='first_hit')
+    charge, first_hit, waveform = sim(source, _params(det, 0.25), jax.random.PRNGKey(3))
+    charge, first_hit, waveform = (np.asarray(a) for a in (charge, first_hit, waveform))
+    np.testing.assert_allclose(charge[target], N * QE, rtol=1e-3)
+    np.testing.assert_allclose(waveform[target].sum(), charge[target], rtol=1e-3)
+    np.testing.assert_allclose(first_hit[target].sum(), 1.0 - np.exp(-waveform[target].sum()), atol=1e-5)

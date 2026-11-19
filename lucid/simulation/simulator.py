@@ -575,12 +575,17 @@ def setup_event_simulator(
         raise ValueError(
             "tabulated SK reflection models require pmt_detection_model "
             "so A(theta) supplies direct PE response independently of R(theta)")
-    if independent_sensor_detection and (
-            sim_config.is_data or sim_config.use_expected_value is False):
+    # Sampled (data / non-expected-value) photons take ONE fate at a sensor. The tabulated models
+    # define detection independently of reflection (the expected-value step lets weight R continue AND
+    # deposits A(theta)*QE), so the sampled fate is three-way: reflect with R, detected with A(theta)*QE,
+    # lost in the PMT otherwise. The photon step reflects first and deposits the rest, and make_hits then
+    # converts a deposit at the sensor's detection probability, so that probability is divided by (1 - R)
+    # at the deposit (see propagation_step): R * 1 + (1 - R) * D/(1 - R) = R + D, the expected-value budget.
+    sampled_independent_detection = independent_sensor_detection and (
+        sim_config.is_data or sim_config.use_expected_value is False)
+    if sampled_independent_detection and polarization_model == 'sk4':
         raise ValueError(
-            "tabulated SK reflection models currently require "
-            "use_expected_value=True; sampled R/A/T branching is not yet "
-            "implemented")
+            "sampled tabulated-PMT detection is not implemented with polarization_model='sk4'")
     mie_cosine_sampler, mie_logpdf_fn = get_mie_phase_model(mie_phase_model)
     pmt_timing_fn = get_pmt_timing_model(pmt_timing_model)
 
@@ -1264,6 +1269,20 @@ def setup_event_simulator(
 
             key, subkey = jax.random.split(key)
             rng_keys = jax.random.split(subkey, n_rays)
+
+            if sampled_independent_detection:
+                # A sampled photon that reaches a PMT reflects with R(theta) or is deposited, and the deposit
+                # converts at qe * response (make_hits). The tabulated model's detection D = qe * response is
+                # independent of R, so the deposit converts at D / (1 - R): detected with probability D, lost
+                # in the PMT with 1 - R - D (D is capped at 1 - R, the photon's whole budget). R is the one the
+                # photon step evaluates: the same model, at the same direction and normal.
+                interaction_directions = jnp.where(
+                    hit_sensor[:, None], physics_surface_directions, state.directions)
+                sensor_reflectance = jax.vmap(
+                    lambda d, n, h, k: reflection_fn(d, n, h, refl_params, refl_lam, k)[0]
+                )(interaction_directions, normals, hit_sensor, rng_keys)
+                pmt_response_factor = pmt_response_factor / jnp.maximum(
+                    1.0 - sensor_reflectance, 1e-3)[None, :]
 
             # vmap: per-photon scatter/absorption and surface coverage; scalar
             # g and packed refl_params.
