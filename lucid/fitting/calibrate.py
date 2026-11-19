@@ -60,7 +60,7 @@ def calibrate(sim, sources, params, data, theta0, *,
               q_floor=None, q_floor_frac=0.01, gauge='log', fix=(), seed=0,
               lr=1.0, lr_final=None, scale=None, readout='final', polyak=0,
               map_fn=None, predict=None, forward=None, on_step=None,
-              tx=None, needs_metric=True, response=None, data_var=None):
+              tx=None, needs_metric=True, response=None, data_var=None, source_columns=None):
     """Fit detector parameters to observed per-sensor charge.
 
     Parameters
@@ -109,10 +109,13 @@ def calibrate(sim, sources, params, data, theta0, *,
         unlit sensors dominate the fit.
     gauge : ``'log'`` or ``'linear'``
         Gain gauge; see :func:`lucid.fitting.calib.profile_gains`.
-    response : :class:`~lucid.fitting.calib.PulseResponse` or None
-        The digitizer and dark noise for a pulsed source: the model becomes the recorded charge
-        over the run rather than the gain times the forward. None (default): the gain times the
-        forward.
+    response : :class:`~lucid.fitting.calib.PulseResponse`, :class:`~lucid.fitting.calib.DigitResponse` or None
+        The digitizer in the model: the model becomes the recorded charge over the run rather than
+        the gain times the forward, and the per-PMT gains are profiled through it (Newton per PMT).
+        ``PulseResponse``: the gain multiplies the forward's charge before a pulse-charge response.
+        ``DigitResponse``: ``predict`` returns the expected windows per number of photoelectrons and
+        the gain acts inside the recorded charge of a window, ``c_m(g)``. None (default): the gain
+        times the forward.
     data_var : array ``(S, n_sensors)`` or None
         The measured variance of ``data``, used in the Neyman weight in place of ``data`` itself
         (see :func:`lucid.fitting.calib.neyman_variance`); :func:`pulsed_closure_data` returns it.
@@ -120,6 +123,10 @@ def calibrate(sim, sources, params, data, theta0, *,
         Selects both key streams. Vary it to build an ensemble.
     predict, map_fn
         Forward dispatch overrides; see :class:`~lucid.fitting.calib.CalibrationForward`.
+    source_columns : sequence of index arrays or None
+        With ``predict``: for each source, the entries of ``theta`` that can move its charge (the shared parameters and its own). Its Jacobian
+        is then taken with respect to those alone, which cuts the tangent batch and its memory; the other columns are exactly zero. None:
+        every column for every source. See :class:`~lucid.fitting.calib.CalibrationJacobian`.
     forward : CalibrationForward or None
         A forward built earlier, to be reused rather than rebuilt. Purely a cost argument: a
         caller that already has one — because it generated its own data with
@@ -158,7 +165,8 @@ def calibrate(sim, sources, params, data, theta0, *,
             raise ValueError(f'the supplied forward has {fwd.n_sources} sources but {len(sources)} '
                              f'were passed')
     jac = CalibrationJacobian(sim, sources, params, n_sensors, key0=jkey,
-                              map_fn=map_fn, predict=predict, response=response)
+                              map_fn=map_fn, predict=predict, response=response,
+                              source_columns=source_columns)
     if data.shape[0] != fwd.S:
         raise ValueError(f'data has {data.shape[0]} rows but the forward produces {fwd.S} '
                          f'({fwd.W} wavelengths x {fwd.n_sources} sources)')
