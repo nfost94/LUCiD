@@ -70,13 +70,15 @@ Models (every electronics/PMT number sourced from WCSim — see
 `lucid/simulation/digitizer.py` for `WCSim/...` citations):
 - **`basic`** — ∞ window → one digit per sensor, the legacy first-arrival + summed
   charge behaviour (default; idealized passthrough).
-- **`ski`** — SK 20″ PMT (`PMT20inch`): 200 ns window, no deadtime, WCSim's
-  S-curve discriminator, per-photoelectron SPE charge, charge-dependent Gaussian time jitter,
+- **`ski`** — SK 20″ PMT (`PMT20inch`): 200 ns window, no deadtime, 0.25 pe
+  threshold, per-photoelectron SPE charge, charge-dependent Gaussian time jitter,
   4.2 kHz dark.
 - **`hk`** — HK 20″ Box&Line PMT (`BoxandLine20inchHQE`): same window/threshold,
   its own (sharper) SPE + exponentially-modified-Gaussian time jitter, 4.2 kHz dark.
+- **`ski_wcsim`** / **`hk_wcsim`** — `ski` / `hk` with WCSim's S-curve discriminator in place of
+  the sharp threshold (and, for HK, an SPE spectrum refitted to WCSim's table).
 
-Any parameter (`integration_window_ns`, `deadtime_ns`, `pe_precision`,
+Any parameter (`integration_window_ns`, `deadtime_ns`, `threshold_pe`,
 `dark_rate_khz`, …) is overridable in the block.
 
 Non-`basic` models can record **multiple digits per sensor** when light arrives

@@ -16,7 +16,7 @@ from lucid.simulation.digitizer import (pulse_charge_response, resolve_model_con
 from tests import _calib_toy as toy
 from tests._calib_toy import FIELDS
 
-HK = resolve_model_config({"model": "hk", "pe_precision": 0.3})
+HK = resolve_model_config({"model": "hk_wcsim", "pe_precision": 0.3})
 DARK = 4.6725e3 * 1350e-9                # HK dark rate x full readout, per pulse
 
 

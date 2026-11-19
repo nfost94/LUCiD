@@ -9,7 +9,7 @@
   "qe_corrections": 1.0,
   "digitizer": {
     "_note": "WCSim SKI digitizer as the HK production macro sets it: DeadTime 560 ns, TimingPrecision 0.1 ns, PEPrecision 0.3; dark rate 4.2 kHz x SetConvert 1.1125 (pulses before the threshold curve, which keeps ~90% of them).",
-    "model": "hk",
+    "model": "hk_wcsim",
     "deadtime_ns": 560.0,
     "tdc_ns": 0.1,
     "pe_precision": 0.3,
