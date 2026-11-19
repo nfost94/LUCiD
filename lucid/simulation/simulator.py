@@ -53,7 +53,7 @@ from lucid.simulation.pmt_siren import (
 from lucid.simulation.sensor_response import (
     make_hits_simulation, make_hits_data, make_hits_likelihood, make_hits_moments,
     make_hits_per_photon,
-    build_make_hits_waveform, build_make_hits_waveform_expected,
+    build_make_hits_waveform, build_make_hits_waveform_expected, build_make_hits_first_hit,
     build_make_hits_per_photon_shotgun,
 )
 
@@ -194,6 +194,11 @@ def setup_event_simulator(
         - ``'aggregated'`` -- differentiable per-sensor (charges, times). Default for calibration.
         - ``'per_photon'`` -- per-photon arrays (log_w, times, indices, charges). Default for track.
         - ``'realistic'`` -- Bernoulli QE sampling, hard-min timing, optional smearing. Default for data.
+        - ``'first_hit'`` -- expected-value (calibration): ``(charge, first_hit, waveform)``, the
+          per-sensor expected charge, and per pulse the distribution of the sensor's first PE in time
+          and the expected waveform, binned as ``waveform_config`` sets (window_ns, bin_width_ns,
+          tts_sigma_ns, t_min_ns). The first-hit time depends on the sensor's charge, which
+          ``'aggregated'``'s soft-min time does not. See ``sensor_response.first_hit_density``.
     wavelength_sampling : str
         How LUCiD samples λ when it samples (track mode, calibration with
         ``source.wavelength=None``). Ignored silently when the caller supplies
@@ -604,7 +609,7 @@ def setup_event_simulator(
 
     # ---- Resolve hit_mode ---------------------------------------------------
     _VALID_HIT_MODES = ('aggregated', 'per_photon', 'realistic', 'moments', 'per_segment',
-                        'waveform', 'waveform_expected', 'shotgun_per_photon')
+                        'waveform', 'waveform_expected', 'shotgun_per_photon', 'first_hit')
     if hit_mode is None:
         if sim_config.is_data:
             hit_mode = 'realistic'
@@ -677,6 +682,15 @@ def setup_event_simulator(
                                          qe_key, qe, qe_corrections, response=None, flat_segment_idx=None, pmt_response_factor=None, flat_indirect=None):
             return _wf_exp_fn(flat_weights, flat_indices, flat_times, num_sensors,
                               qe_key, qe, qe_corrections, pmt_response_factor)
+    elif hit_mode == 'first_hit':
+        # Expected waveform and the first-hit distribution it implies; the TTS is applied as a
+        # convolution (deterministic), so there is no per-slot noise draw and no charge smear.
+        _fh_cfg = {k: v for k, v in _wf_cfg.items() if k != 'smear_charge'}
+        _fh_fn = build_make_hits_first_hit(**_fh_cfg)
+        def _make_hits_first_hit(flat_weights, flat_indices, flat_times, num_sensors,
+                                 qe_key, qe, qe_corrections, response=None, flat_segment_idx=None, pmt_response_factor=None, flat_indirect=None):
+            return _fh_fn(flat_weights, flat_indices, flat_times, num_sensors,
+                          qe_key, qe, qe_corrections, pmt_response_factor)
     elif hit_mode == 'shotgun_per_photon':
         _pp_fn = build_make_hits_per_photon_shotgun(
             n_photons=n_photons,
@@ -698,6 +712,7 @@ def setup_event_simulator(
         'waveform': _make_hits_waveform if hit_mode == 'waveform' else None,
         'waveform_expected': _make_hits_waveform_expected if hit_mode == 'waveform_expected' else None,
         'shotgun_per_photon': _make_hits_shotgun_pp if hit_mode == 'shotgun_per_photon' else None,
+        'first_hit': _make_hits_first_hit if hit_mode == 'first_hit' else None,
     }[hit_mode]
 
     # ---- Wavelength-dependent medium (when wavelength_mode=True) -----

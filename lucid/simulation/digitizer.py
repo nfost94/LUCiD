@@ -84,7 +84,7 @@ per sensor and runs host-side after the simulation kernel.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 
 import numpy as np
 
@@ -490,6 +490,99 @@ def apply_readout_resolution(
         pe_reco = np.clip(pe_true + rng.normal(size=pe_true.shape) * sigma, 0.0, None)
     t = _sample_time_jitter(digit_time, pe_reco, model, rng)
     return pe_reco.astype(np.float32), t.astype(_T_DTYPE)
+
+
+def single_pe_time_response(model: dict, bin_ns: float, t_lo_ns: float = -10.0, t_hi_ns: float = 60.0,
+                            n_draws: int = 10_000_000, seed: int = 0, chunk: int = 2_000_000):
+    """The digitiser's response to ONE photoelectron arriving at t = 0, on a time grid: ``(kernel, centre)``.
+
+    ``kernel[j]`` is the probability that the PE becomes a recorded digit whose time lies within half a bin of ``(j - centre) * bin_ns``: the digit's charge is sampled from the SPE
+    spectrum, its time gets the charge-dependent jitter and the TDC truncation, and the discriminator fires on that charge, the steps :func:`apply_readout_resolution` and
+    :func:`apply_discriminator` take in :func:`digitize_and_decompose`. Sampled with those functions, so the kernel cannot drift from them. Its sum is the discriminator's
+    single-PE efficiency. Convolving an expected waveform with it (``sensor_response.apply_time_response``) gives the waveform of the PEs that become digits, at the
+    times the digitiser records them: exact for a digit made of one PE, the low-occupancy case (a digit of several PEs has a larger charge, less jitter and a likelier discriminator).
+    """
+    rng = np.random.default_rng(seed)
+    centre = int(round(-t_lo_ns / bin_ns))
+    n_bins = centre + int(round(t_hi_ns / bin_ns)) + 1
+    edges = (np.arange(n_bins + 1) - centre - 0.5) * bin_ns
+    counts = np.zeros(n_bins)
+    done = 0
+    while done < n_draws:
+        m = min(chunk, n_draws - done)
+        pe, t = apply_readout_resolution(np.ones(m), np.zeros(m), model, rng)
+        keep = apply_discriminator(pe, model, rng)
+        counts += np.histogram(t[keep], bins=edges)[0]
+        done += m
+    return counts / n_draws, centre
+
+
+class DigitKernels(NamedTuple):
+    """The digitiser's response to a window of m photoelectrons, m = 1 ... n_max, on a time grid and a charge grid (:func:`digit_response_kernels`).
+
+    ``time[m - 1, j]``: the probability that the digit is kept and lands ``j - centre`` bins after the window's first PE. ``charge_time[m - 1, j]``: the same weighted by the digit's recorded
+    charge (PE). ``charge_pmf[m - 1, k]``: the probability that the digit is kept and records ``charge_levels[k]`` (PE). Each row of ``time`` and of ``charge_pmf`` sums to the probability that a
+    window of m PEs gives a digit.
+    """
+    time: np.ndarray
+    charge_time: np.ndarray
+    charge_pmf: np.ndarray
+    centre: int
+    charge_levels: np.ndarray
+    charge_step: float
+
+
+def digit_response_kernels(model: dict, bin_ns: float, n_max: int, t_lo_ns: float = -10.0, t_hi_ns: float = 60.0,
+                           n_draws: int = 1_000_000, seed: int = 0, chunk: int = 1_000_000) -> DigitKernels:
+    """The digitiser's response to a window holding m photoelectrons, for m = 1 ... ``n_max``: where its digit lands in time and what charge it records.
+
+    The digit of a window of m PEs is the window's first PE, delayed by the charge-dependent jitter of the SPE sum of m draws, kept with the discriminator's probability for that charge, and recorded
+    with the charge step applied. The kernels are sampled with the digitiser's own functions (:func:`apply_readout_resolution`, :func:`discriminator_efficiency`,
+    :func:`apply_charge_precision`), so they cannot drift from them; the discriminator is taken in expectation rather than drawn. They depend on the digitiser model only, not on any fitted parameter:
+    sample them once and hold them as constants (``sensor_response.digit_expectation`` mixes them over the number of PEs in each window).
+
+    The time grid runs from ``t_lo_ns`` to ``t_hi_ns`` after the first PE's bin, in bins of ``bin_ns``; a digit outside it is lost. The first PE sits at the centre of its bin, which starts at a multiple of ``bin_ns`` on the
+    absolute time axis, with its phase on the TDC grid uniform over one step. The TDC truncates on the absolute grid (as WCSim's does), so with ``bin_ns`` a multiple of the TDC step a bin's edges sit on the grid and a
+    digit stays in its time's bin but is recorded up to a step early (half a step on average): an effective advance that a PE placed at one phase of the grid misses. The charge grid is the model's charge step (``pe_precision``; 0.1 PE when
+    the model has none) up to the largest charge ``n_max`` PEs can reach; any charge above it is put on the last level. ``n_draws`` windows are drawn for each m.
+
+    A binned rate does not say where in its bin a PE arrived, and a PE put at the bin's centre adds a uniform spread of one bin to the continuous arrival times, a variance ``bin_ns ** 2 / 12`` (Sheppard's correction):
+    digits computed from the binned rate are too broad by it, which shows as a deficit just before a sharp rise and an excess just after it, of a fraction of a percent of the cells at a 0.5 ns bin. The time kernels (``time``,
+    ``charge_time``) are therefore deconvolved by that spread, to second order, by :func:`_remove_bin_spread`; their sums are unchanged. (Spreading the PE uniformly over its bin instead would add a second such variance.)
+    """
+    rng = np.random.default_rng(seed)
+    centre = int(round(-t_lo_ns / bin_ns))
+    n_bins = centre + int(round(t_hi_ns / bin_ns)) + 1
+    edges = (np.arange(n_bins + 1) - centre) * bin_ns                       # bin `centre` is [0, bin_ns): the bin the first PE is in
+    dither = float(model.get("tdc_ns", 0.0))                              # one step of the TDC: the phase of a continuous PE time on its grid
+    step = float(model.get("pe_precision", 0.0))
+    if step <= 0.0:
+        step = 0.1
+    n_levels = int(np.ceil((n_max + 6.0 * np.sqrt(n_max) + 6.0) / step)) + 1
+    time_k = np.zeros((n_max, n_bins))
+    charge_time_k = np.zeros((n_max, n_bins))
+    charge_pmf = np.zeros((n_max, n_levels))
+    for m in range(1, n_max + 1):
+        done = 0
+        while done < n_draws:
+            k = min(chunk, n_draws - done)
+            pe, t = apply_readout_resolution(np.full(k, float(m)), 0.5 * bin_ns + dither * rng.uniform(-0.5, 0.5, k), model, rng)   # the first PE at its bin's centre, its phase on the TDC grid uniform
+            keep = discriminator_efficiency(pe, model)
+            q = np.asarray(apply_charge_precision(pe, model), dtype=np.float64)
+            time_k[m - 1] += np.histogram(t, bins=edges, weights=keep)[0]
+            charge_time_k[m - 1] += np.histogram(t, bins=edges, weights=keep * q)[0]
+            level = np.minimum(np.rint(q / step).astype(np.int64), n_levels - 1)
+            charge_pmf[m - 1] += np.bincount(level, weights=keep, minlength=n_levels)
+            done += k
+    return DigitKernels(_remove_bin_spread(time_k / n_draws), _remove_bin_spread(charge_time_k / n_draws), charge_pmf / n_draws, centre, np.arange(n_levels) * step, step)
+
+
+def _remove_bin_spread(kernel: np.ndarray) -> np.ndarray:
+    """Deconvolve rows of time kernels (m, bins) by the spread of one bin, to second order: K(j) - (K(j + 1) - 2 K(j) + K(j - 1)) / 24, since a uniform spread of one bin adds the variance bin_ns ** 2 / 12,
+    that is ``(bin_ns ** 2 / 24) f''`` to a density f, and a second difference over bin_ns ** 2 is ``f''``. Each row's sum is unchanged apart from the grid's two ends (empty tails); the few entries
+    this makes negative, a twenty-fourth of a neighbour in an empty tail, are set to zero."""
+    p = np.pad(kernel, ((0, 0), (1, 1)))
+    return np.maximum(kernel - (p[:, 2:] - 2.0 * kernel + p[:, :-2]) / 24.0, 0.0)
 
 
 def _encode_keys(key_cols):
