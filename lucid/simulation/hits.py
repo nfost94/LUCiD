@@ -25,6 +25,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from lucid.utils import smear_charges_SK_like, smear_charges_spe
 
@@ -68,6 +69,15 @@ class Waveform(NamedTuple):
     waveform: jnp.ndarray
     n_dropped: jnp.ndarray
     n_detected: jnp.ndarray
+
+
+class FirstHit(NamedTuple):
+    """Per sensor: the expected charge (PE, all times); per sensor and time bin, per pulse, the
+    distribution of the sensor's first PE (:func:`first_hit_density`) and the expected waveform."""
+
+    charge: jnp.ndarray
+    first_hit: jnp.ndarray
+    waveform: jnp.ndarray
 
 
 class PhotonHits(NamedTuple):
@@ -596,6 +606,85 @@ def waveform_expected(
     return Waveform(waveform, n_dropped, n_detected)
 
 
+def first_hit_expected(
+    flat_weights,
+    flat_indices,
+    flat_times,
+    num_sensors,
+    key,
+    qe,
+    qe_corrections,
+    response,
+    flat_segment_idx,
+    flat_indirect,
+    *,
+    window_ns=500.0,
+    bin_width_ns=1.0,
+    tts_sigma_ns=1.0,
+    t_min_ns=0.0,
+    smear_time=True,
+    threshold=1e-10,
+):
+    """The expected first-hit time distribution of every sensor, which depends on its charge.
+
+    Every deposit's QE-weighted charge goes into the ``(sensor, time_bin)`` cell its arrival time
+    falls in (the expected waveform, as :func:`waveform_expected`), the PMT's transit-time spread is
+    applied to that waveform as a convolution with the bin-integrated Gaussian (deterministic, no
+    noise draw), and :func:`first_hit_density` turns each sensor's smeared waveform into the
+    distribution of its first PE. :func:`first_arrival_expected`'s time ignores the charge: it is
+    the same for 0.01 PE and for 100 PE.
+
+    ``charge`` is the expected PE count over all times; ``first_hit`` and ``waveform`` are per
+    pulse. Deposits outside the window are in ``charge`` but not in the two histograms, so
+    ``first_hit.sum(1)`` is ``1 - exp(-waveform.sum(1))``. For N pulses, multiply every output by
+    N (the first-hit distribution is per pulse, so N times it counts the pulses with a hit in each
+    bin).
+
+    Parameters
+    ----------
+    window_ns, bin_width_ns, t_min_ns : float
+        Readout window / bin grid (as :func:`waveform_expected`).
+    tts_sigma_ns : float
+        Gaussian transit-time spread of one PE; applied before the first-hit step, as it acts on
+        each PE.
+    smear_time : bool
+        Toggle the smearing.
+    threshold : float
+        Minimum per-slot charge to be counted as physical.
+    """
+    n_time_bins = int(round(window_ns / bin_width_ns))
+    slot_charge = flat_weights * qe * qe_corrections[flat_indices]
+    valid = (slot_charge > threshold) & (flat_times > 0) & jnp.isfinite(flat_times)
+    charge = jax.ops.segment_sum(
+        jnp.where(valid, slot_charge, 0.0), flat_indices, num_segments=num_sensors
+    )
+
+    bin_idx = jnp.floor((flat_times - t_min_ns) / bin_width_ns).astype(jnp.int32)
+    keep = valid & (bin_idx >= 0) & (bin_idx < n_time_bins)
+    cell = jnp.where(keep, flat_indices * n_time_bins + bin_idx, 0)
+    rate = jax.ops.segment_sum(
+        jnp.where(keep, slot_charge, 0.0), cell, num_segments=num_sensors * n_time_bins
+    ).reshape(num_sensors, n_time_bins)
+
+    if smear_time and tts_sigma_ns > 0:
+        rate = apply_time_response(rate, *_gaussian_kernel(tts_sigma_ns, bin_width_ns))
+
+    return FirstHit(charge, first_hit_density(rate), rate)
+
+
+def _gaussian_kernel(sigma_ns, bin_width_ns):
+    """The bin-integrated Gaussian of width ``sigma_ns`` on a grid of ``bin_width_ns``, normalised:
+    ``(kernel, centre)`` for :func:`apply_time_response`."""
+    from scipy.special import ndtr
+
+    half = int(np.ceil(4.0 * sigma_ns / bin_width_ns))
+    offsets = np.arange(-half, half + 1) * bin_width_ns
+    kernel = ndtr((offsets + 0.5 * bin_width_ns) / sigma_ns) - ndtr(
+        (offsets - 0.5 * bin_width_ns) / sigma_ns
+    )
+    return (kernel / kernel.sum()).astype(np.float32), half
+
+
 def photon_hits_sampled(
     flat_weights,
     flat_indices,
@@ -662,6 +751,7 @@ HITS = {
     ("segment_truth", "sampled"): segment_truth_sampled,
     ("waveform", "expected"): waveform_expected,
     ("waveform", "sampled"): waveform_sampled,
+    ("first_hit", "expected"): first_hit_expected,
     ("photon_hits", "sampled"): photon_hits_sampled,
 }
 
@@ -694,3 +784,136 @@ def bind_hits(hits, detection, hits_config, n_photons, charge_resolution):
         )
     setup = dict(n_photons=n_photons, charge_resolution=charge_resolution)
     return partial(fn, **{k: v for k, v in setup.items() if k in options}, **hits_config)
+
+
+# ===================================================================
+# The first hit and the digitiser, from an expected waveform
+# ===================================================================
+
+
+def first_hit_density(rate):
+    """Probability that a sensor's first photoelectron falls in each time bin, from its expected arrival rate.
+
+    ``rate`` is the expected number of PEs per bin, shape ``(..., n_bins)``: the expected waveform, the
+    QE-weighted arrival density times the sensor's charge. If each bin's count is an independent Poisson
+    variable with that mean, the first PE is in bin b with probability ``exp(-C_{b-1}) * (1 - exp(-r_b))``,
+    C the cumulative rate: the discrete form of ``g(t) = lambda(t) * exp(-Lambda(t))``.
+
+    It sums over the bins to ``1 - exp(-sum r)``, the chance of at least one PE in the window, and it depends on
+    the charge through ``exp(-C)``: at a low charge it is the rate itself, at a high charge it is pushed to the
+    earliest arrivals. Nonlinear in ``rate``, so average ``rate`` over forward draws first and apply this to the average.
+    """
+    cum = jnp.cumsum(rate, axis=-1)
+    cum_before = jnp.concatenate([jnp.zeros_like(cum[..., :1]), cum[..., :-1]], axis=-1)
+    return jnp.exp(-cum_before) * (-jnp.expm1(-rate))
+
+
+def apply_time_response(rate, kernel, centre):
+    """A PMT's time response applied to an expected waveform: each row of ``rate`` (``(..., n_bins)``, PEs per bin) convolved with ``kernel`` on the same bin grid.
+
+    ``out[b] = sum_j kernel[j] * rate[b - (j - centre)]``: ``kernel[centre]`` is the zero offset, so a kernel that is not symmetric about it (an exponential late tail) delays the
+    waveform as it widens it. The kernel need not sum to one: its sum is the fraction of PEs that survive (a discriminator's efficiency), and the waveform it
+    returns is that thinned rate. Build one with ``digitizer.single_pe_time_response`` (the digitiser's own response to one PE) or from a Gaussian.
+    The PE count falling off either end of the window is lost.
+    """
+    kernel = jnp.asarray(kernel, dtype=rate.dtype)
+    length, centre, n = int(kernel.shape[0]), int(centre), rate.shape[-1]
+    out = jax.lax.conv_general_dilated(
+        rate.reshape(-1, 1, n),
+        kernel[::-1][None, None, :],
+        window_strides=(1,),
+        padding=[(length - 1 - centre, centre)],
+        dimension_numbers=("NCW", "OIW", "NCW"),
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    return out.reshape(rate.shape)
+
+
+def _window_weights(rate, n_pe, window_bins, dead_bins):
+    """The expected windows by number of PEs, at each bin where one opens: ``(n_sensors, n_pe, n_bins)``, from ``rate`` ``(n_sensors, n_bins)`` (already floored above zero).
+
+    The window openings and the Poisson number of other PEs in the window (see :func:`digit_expectation`), which depend on the rate alone: the digitiser enters only afterwards, through its kernels."""
+    from jax.scipy.special import gammainc, gammaln
+
+    n_bins = rate.shape[-1]
+    reach = window_bins + dead_bins
+
+    # The window openings, in logs: exp(R(a + L) - R(t - 1)) is a ratio of cumulative rates, far too large or small on its own for a bright sensor.
+    cum = jnp.cumsum(rate, axis=-1)
+    log_open = jnp.log(-jnp.expm1(-rate)) - (cum - rate)  # log g(t)
+    log_a = log_open
+    for b in range(
+        max(0, -(-(n_bins - reach - 1) // reach))
+    ):  # blocks of `reach` bins: a window after the first depends on the openings before it
+        lo = reach + 1 + b * reach
+        hi = min(lo + reach, n_bins)
+        past = jax.lax.associative_scan(
+            jnp.logaddexp, log_a[:, : hi - reach - 1] + cum[:, reach : hi - 1], axis=-1
+        )
+        log_a = log_a.at[:, lo:hi].add(jax.nn.softplus(past[:, lo - reach - 1 : hi - reach - 1]))
+    openings = jnp.exp(log_a)
+
+    # The other PEs in the window.
+    cum_ahead = jnp.concatenate([cum, jnp.repeat(cum[:, -1:], window_bins, axis=-1)], axis=-1)[
+        :, window_bins : window_bins + n_bins
+    ]
+    small = rate < 1e-3
+    safe = jnp.where(small, 1.0, rate)
+    same_bin = jnp.where(small, 0.5 * rate + rate**2 / 12.0, safe / -jnp.expm1(-safe) - 1.0)
+    mu = jnp.maximum(cum_ahead - cum + same_bin, 1e-30)
+    n = jnp.arange(n_pe, dtype=rate.dtype).reshape(1, -1, 1)
+    p = jnp.exp(n * jnp.log(mu[:, None, :]) - mu[:, None, :] - gammaln(n + 1.0))
+    if n_pe > 1:
+        p = p.at[:, -1, :].set(
+            gammainc(float(n_pe - 1), mu)
+        )  # P(at least n_pe - 1 others): the last kernel takes the weight beyond it
+    else:
+        p = jnp.ones_like(p)
+    return openings[:, None, :] * p
+
+
+@partial(jax.jit, static_argnames=("n_pe", "window_bins", "dead_bins"))
+def digit_windows(rate, n_pe, window_bins, dead_bins):
+    """The expected number of windows holding m = 1 ... n_pe PEs, per sensor and pulse: ``digit_expectation``'s ``windows`` without the digitiser's kernels or their convolution.
+
+    ``rate`` ``(n_sensors, n_bins)`` as in :func:`digit_expectation`. The windows depend on the rate alone, so a digitiser (or a PMT's gain, which acts on the charge of the PEs in a window) enters only as
+    the recorded charge of a window of m PEs. Returns ``(n_sensors, n_pe)``, the last column taking all the weight beyond it, as the last kernel does."""
+    return _window_weights(jnp.maximum(rate, 1e-30), n_pe, window_bins, dead_bins).sum(axis=-1)
+
+
+@partial(jax.jit, static_argnames=("centre", "window_bins", "dead_bins"))
+def digit_expectation(
+    rate, time_kernel, charge_time_kernel, charge_pmf, centre, window_bins, dead_bins
+):
+    """The expected digits of a PMT from its expected PE rate: the analytic form of the digitiser, differentiable in the rate.
+
+    ``rate`` ``(n_sensors, n_bins)`` is the expected number of PEs per bin per pulse, dark included, at the times the digitiser's windowing sees them (not smeared by a transit-time spread the
+    digitiser's own jitter already is). Each sensor's PEs are independent Poisson counts per bin, as in :func:`first_hit_density`. The digitiser (``digitizer.digitize_event`` and the readout after it) opens a
+    window of ``window_bins`` at a PE, sums the charge of the PEs in it into one digit timed at the opening PE, and ignores the PEs of the next ``dead_bins``; the next PE opens the next window.
+
+    A window opens in bin t with probability ``A(t) = g(t) (1 + sum_{a < t - L} A(a) exp(R(a + L)))``, ``g`` the first-hit density, ``R`` the cumulative rate and ``L = window_bins + dead_bins``: the first PE
+    ever, or the first PE after the dead time of the window before it. The PEs in the window besides the opening one are Poisson with mean ``mu(t)``: the rate in the next ``window_bins`` bins, plus the mean
+    number of extra PEs in the opening bin (given at least one, ``r / (1 - exp(-r)) - 1``; their shape is taken as Poisson). The digit of a window of m PEs is ``digitizer.digit_response_kernels``, whose
+    time, charge-weighted time and charge arrays are mixed over the Poisson number of PEs, the last kernel taking all the weight beyond it. The digit's time and charge are correlated through the windows' opening
+    times, and dark PEs are in the rate: a dark PE can open the window, join it, or veto what follows.
+
+    Returns, per sensor and pulse: ``digits`` ``(n_sensors, n_bins)``, the expected number of digits at each time; ``charge`` ``(n_sensors, n_bins)``, their expected recorded charge (so the mean charge of the
+    digits at a time is ``charge / digits``); ``levels`` ``(n_sensors, n_levels)``, the expected digits by recorded charge (``DigitKernels.charge_levels``); ``windows`` ``(n_sensors, n_pe)``, the expected number
+    of windows holding m = 1 ... n_pe PEs, before the discriminator. Digits later than the last bin are lost. The first window starts at the first bin with no earlier history, so dark that opened a window or a dead time
+    before the first bin is not in it. Memory is ``n_sensors * n_pe * n_bins`` values: batch the sensors.
+    """
+    rate = jnp.maximum(rate, 1e-30)
+    # The digits: each opening time's weight, by number of PEs, spread over the digit times and charges.
+    weights = _window_weights(rate, time_kernel.shape[0], window_bins, dead_bins)
+    kernel = jnp.stack([time_kernel, charge_time_kernel]).astype(rate.dtype)
+    length = kernel.shape[-1]
+    out = jax.lax.conv_general_dilated(
+        weights,
+        kernel[..., ::-1],
+        window_strides=(1,),
+        padding=[(length - 1 - centre, centre)],
+        dimension_numbers=("NCW", "OIW", "NCW"),
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    windows = weights.sum(axis=-1)
+    return out[:, 0], out[:, 1], windows @ jnp.asarray(charge_pmf, dtype=rate.dtype), windows

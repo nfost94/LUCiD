@@ -70,3 +70,17 @@ def test_setup_bounds_qe_by_the_non_reflected_fraction(tiny_sim):
     tiny.simulator(default_detector_params=_params(tiny_sim, 0.25, qe=0.75))
     with pytest.raises(ValueError, match="1 - R0"):
         tiny.simulator(default_detector_params=_params(tiny_sim, 0.25, qe=0.8))
+
+
+def test_first_hit_hits_return_the_charge_the_waveform_and_the_hit_distribution(beam):
+    """hits='first_hit' on the pencil beam: the charge is QE x photons, the waveform holds it, and
+    the first-hit distribution sums to the chance of a hit."""
+    target, source = beam
+    sim = tiny.simulator(hits="first_hit")
+    out = sim(source, _params(sim, 0.25), jax.random.PRNGKey(3))
+    charge, first_hit, waveform = (np.asarray(a) for a in out)
+    np.testing.assert_allclose(charge[target], N * QE, rtol=1e-3)
+    np.testing.assert_allclose(waveform[target].sum(), charge[target], rtol=1e-3)
+    np.testing.assert_allclose(
+        first_hit[target].sum(), 1.0 - np.exp(-waveform[target].sum()), atol=1e-5
+    )
