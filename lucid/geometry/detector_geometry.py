@@ -6,6 +6,7 @@ from typing import Callable, NamedTuple, Optional
 import jax.numpy as jnp
 
 from lucid.geometry import get_detector_class, load_detector_config
+from lucid.geometry.detector import resolve_sensor_shape
 from lucid.propagation.shared import create_propagator as create_shared_propagator
 from lucid.wavelength.medium import MediumProperties, load_medium
 
@@ -26,12 +27,14 @@ class DetectorGeometry(NamedTuple):
     detector: object = None  # the Detector instance
     propagator: Optional[Callable] = None  # JIT-compiled propagate_photons
     grid: Optional[NamedTuple] = None  # the propagator's frozen grid (surface detectors)
+    sensor_shape: str = "sphere"  # the PMT type (lucid.geometry.detector.SENSOR_SHAPES)
 
     @staticmethod
     def from_config(
         json_filename: str,
         temperature: float = 0.2,
         medium: Optional[MediumProperties] = None,
+        sensor_shape: Optional[str] = None,
         **grid_params,
     ) -> "DetectorGeometry":
         """Build a DetectorGeometry from a config JSON file.
@@ -49,13 +52,27 @@ class DetectorGeometry(NamedTuple):
         medium : MediumProperties, optional
             The loaded medium (a physics config's ``medium_model``); it must be the JSON's
             ``material``. None loads ``config/materials/<material>.json``.
+        sensor_shape : {'sphere', 'hk50cm'} or None
+            PMT type; default None takes the config's (``sensor_shape`` in
+            ``geometry_definitions``), else 'sphere', the wall-mounted hemisphere of the config's
+            sensor radius (see :func:`lucid.geometry.detector.resolve_sensor_shape`). ``'hk50cm'``
+            is the HK Box&Line, the cap of a sphere (:mod:`lucid.propagation.hk_pmt_geometry`).
         **grid_params
             Geometry-specific grid parameters forwarded to ``create_propagator()``.
             Cylinder: n_cap, n_angular, n_height.
             Sphere: n_divisions.
             Box: n_x, n_y, n_z.
             If not provided, auto-derived from detector geometry.
+
+        Returns
+        -------
+        DetectorGeometry
+            Detector layout, sensor arrays, material properties, reference
+            speed in m/ns, and the constructed propagation callable. Optical
+            and response parameters fitted per simulation are supplied
+            separately through ``DetectorParams``.
         """
+        sensor_shape = resolve_sensor_shape(json_filename, sensor_shape)
         cfg = load_detector_config(json_filename)
         if medium is None:
             medium = load_medium(cfg["material"])
@@ -80,13 +97,22 @@ class DetectorGeometry(NamedTuple):
         from lucid.geometry.string import StringTelescope
 
         if isinstance(detector, StringTelescope):
+            if sensor_shape != "sphere":
+                raise ValueError(
+                    f"sensor_shape={sensor_shape!r} is only available for surface-detector PMTs"
+                )
             from lucid.propagation.string.string_propagator import create_string_propagator
 
             propagator = create_string_propagator(detector, sensor_radius, temperature=temperature)
             grid = None
         else:
             propagator, grid = create_shared_propagator(
-                detector, sensor_points, sensor_radius, temperature=temperature, **grid_params
+                detector,
+                sensor_points,
+                sensor_radius,
+                temperature=temperature,
+                sensor_shape=sensor_shape,
+                **grid_params,
             )
 
         return DetectorGeometry(
@@ -99,4 +125,5 @@ class DetectorGeometry(NamedTuple):
             detector=detector,
             propagator=propagator,
             grid=grid,
+            sensor_shape=sensor_shape,
         )

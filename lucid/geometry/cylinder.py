@@ -152,7 +152,10 @@ class Cylinder(Detector):
     def from_config(cls, geometry, config_dir):
         """Measured PMTs when ``geometry`` names an ``npz_file_path``, else the algorithmic layout."""
         if "npz_file_path" in geometry:
-            return cls.from_pmt_file(os.path.join(config_dir, geometry["npz_file_path"]))
+            return cls.from_pmt_file(
+                os.path.join(config_dir, geometry["npz_file_path"]),
+                snap_to_wall=geometry.get("snap_to_wall", True),
+            )
         return cls(
             geometry["radius"], geometry["height"], geometry["n_sensors"], geometry["sensor_radius"]
         )
@@ -248,6 +251,7 @@ class Cylinder(Detector):
 
         n_barrel = int(np.sum(surfaces == "barrel"))
         n_top = int(np.sum(surfaces == "top"))
+        instance.surfaces = surfaces[order]
         instance.all_points = positions_ord
         instance.barr_points = positions_ord[:n_barrel]
         instance.tcap_points = positions_ord[n_barrel : n_barrel + n_top]

@@ -282,6 +282,7 @@ def test_leg_bound_flags_exactly_the_legs_that_enter_the_sphere():
     w, _, _, _, flag, pts = compute_sensor_intersections_base(
         jnp.zeros(len(o), jnp.int32),
         jnp.asarray(c[None, :], jnp.float32),
+        jnp.asarray([[1.0, 0.0, 0.0]], jnp.float32),
         r_s,
         jnp.asarray(o, jnp.float32),
         jnp.asarray(d, jnp.float32),

@@ -21,7 +21,7 @@ class Detector(ABC):
         n_sensors : int
             Number of photosensors
         sensor_radius : float
-            Radius of individual sensors
+            Radius of individual sensors (the aperture radius)
         """
         self.C = np.array([0.0, 0.0, 0.0])  # Always centered at origin
         self.n_sensors = n_sensors

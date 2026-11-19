@@ -54,6 +54,31 @@ def load_detector_config(file_path):
     return config
 
 
+# PMT types a surface detector can carry (``sensor_shape``):
+#   'sphere'   the wall-mounted hemisphere of the config's sensor_radius (the default)
+#   'hk50cm'   the HK 50 cm Box&Line, a cap of a sphere (lucid.propagation.hk_pmt_geometry)
+SENSOR_SHAPES = ("sphere", "hk50cm")
+
+
+def resolve_sensor_shape(file_path, sensor_shape=None):
+    """The PMT type for a detector config: ``sensor_shape`` given, else the config's, else 'sphere'.
+
+    A detector config names its PMT type as ``sensor_shape`` in ``geometry_definitions``; the type
+    then sets the PMT's geometry. A ``sensor_shape`` given here is for configs that name none; one
+    that disagrees with the config's raises.
+    """
+    configured = load_detector_config(file_path).get("geometry_definitions", {}).get("sensor_shape")
+    if sensor_shape is not None and configured is not None and sensor_shape != configured:
+        raise ValueError(
+            f"sensor_shape={sensor_shape!r} disagrees with {file_path!r}, whose PMT "
+            f"type is {configured!r}"
+        )
+    shape = sensor_shape if sensor_shape is not None else (configured or "sphere")
+    if shape not in SENSOR_SHAPES:
+        raise ValueError(f"sensor_shape must be one of {SENSOR_SHAPES}, got {shape!r}")
+    return shape
+
+
 def generate_detector(file_path):
     """Generate a detector from a JSON config file using the geometry registry.
 
@@ -61,6 +86,9 @@ def generate_detector(file_path):
     the registry, and that class's ``from_config`` builds the detector from
     ``geometry_definitions``. Relative file paths in it (``npz_file_path``) resolve against the
     config file's directory.
+
+    The PMT type (``sensor_shape`` in ``geometry_definitions``) is not read here: it sets the
+    sensor's shape, not where sensors sit. See :func:`resolve_sensor_shape`.
     """
     config = load_detector_config(file_path)
     cls = get_detector_class(config["detector_type"])

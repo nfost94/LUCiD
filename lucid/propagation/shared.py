@@ -16,7 +16,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from lucid.overlap import create_overlap_prob
+from lucid.overlap import cap_sphere, create_overlap_prob
+from lucid.propagation import hk_pmt_geometry
 from lucid.propagation.base import (
     compute_sensor_intersections_base,
     find_closest_sensors,
@@ -176,6 +177,7 @@ def create_propagator(
     sensor_radius,
     temperature=0.2,
     max_candidates_per_ray=4,
+    sensor_shape="sphere",
     **grid_params,
 ):
     """Build a JIT-compiled photon propagator using detector methods.
@@ -185,12 +187,21 @@ def create_propagator(
     detector : Detector
         Detector instance with Phase 9 methods implemented.
     sensor_positions : jnp.ndarray, shape (n_sensors, 3)
+        Centres of the sensor apertures, on the wall.
     sensor_radius : float
+        Aperture radius r.
     temperature : float
         Soft-assignment temperature for overlap probability.
     max_candidates_per_ray : int
         Sensor slots per grid cell (the candidates a ray tests). Raised, with a warning, to the
         most sensors geometry assigns to one cell, so no sensor is dropped from a cell it overlaps.
+    sensor_shape : {'sphere', 'hk50cm'}
+        The PMT type. Each is the cap of a sphere standing on the wall, aperture radius r and
+        height h: a sphere of radius (h^2 + r^2) / (2h) centred (r^2 - h^2) / (2h) behind the
+        aperture. ``'sphere'`` is the hemisphere, h = r, whose soft overlap is the free sphere's
+        disc from every direction. ``'hk50cm'`` is the HK Box&Line, r = 0.254 m and h = 0.18 m,
+        whose soft overlap is the cap's silhouette at the line's incidence
+        (:mod:`lucid.propagation.hk_pmt_geometry`); ``sensor_radius`` must be its aperture.
     **grid_params
         Geometry-specific grid parameters passed to ``detector.make_grid()``.
         Cylinder: n_cap, n_angular, n_height.
@@ -207,6 +218,16 @@ def create_propagator(
     """
     sensor_positions = jnp.array(sensor_positions)
     num_sensors = len(sensor_positions)
+    if sensor_shape not in ("sphere", "hk50cm"):
+        raise ValueError(f"sensor_shape must be 'sphere' or 'hk50cm', got {sensor_shape!r}")
+    if (
+        sensor_shape == "hk50cm"
+        and abs(float(sensor_radius) - hk_pmt_geometry.APERTURE_RADIUS) > 1e-6
+    ):
+        raise ValueError(
+            f"sensor_shape='hk50cm' has aperture radius {hk_pmt_geometry.APERTURE_RADIUS} m; the "
+            f"detector's sensor_radius is {float(sensor_radius)} m"
+        )
 
     # The grid, sized for max_candidates_per_ray unless the caller states the cell counts
     # (a caller's own max_candidates_per_ray in grid_params sizes it instead).
@@ -249,13 +270,35 @@ def create_propagator(
         max_candidates_per_ray,
     )
 
+    # 4c. Sensor shape: the cap of a sphere standing on the wall, of height h (see `sensor_shape`).
+    # Each sensor's axis is the inward wall normal where it sits: a ray from the detector centre
+    # leaves the (convex) detector once, at the sensor, so intersect_ray and compute_normal give that
+    # normal for any geometry. At h == r the depth is exactly 0.0 and the centres are the positions
+    # as given.
+    expose_height = hk_pmt_geometry.EXPOSE_HEIGHT if sensor_shape == "hk50cm" else sensor_radius
+    sphere_radius, centre_depth = cap_sphere(sensor_radius, expose_height)
+    centre = jnp.broadcast_to(
+        jnp.asarray(detector.C, dtype=sensor_positions.dtype), sensor_positions.shape
+    )
+    outward = sensor_positions - centre
+    outward = outward / jnp.linalg.norm(outward, axis=1, keepdims=True)
+    wall_points, _, _, wall_surface = detector.intersect_ray(centre, outward, grid)
+    sensor_axes = -detector.compute_normal(wall_points, wall_surface)
+    sphere_centres = sensor_positions - centre_depth * sensor_axes
+
     # 5. Overlap probability (shared)
     # temperature=None → step function (hard assignment, non-differentiable)
     # temperature=float → Gaussian kernel with sigma = temperature * sensor_radius
-    if temperature is None:
-        overlap_prob = create_overlap_prob(None, sensor_radius)
+    sigma = None if temperature is None else temperature * sensor_radius
+    if sensor_shape == "sphere":
+        # The soft overlap is the free sphere's disc from every direction; the hard step is the
+        # hemisphere's, which is the free sphere's.
+        _free_overlap = create_overlap_prob(sigma, sensor_radius)
+
+        def overlap_prob(d, to_sensor, line_dir, axis):
+            return _free_overlap(d)
     else:
-        overlap_prob = create_overlap_prob(temperature * sensor_radius, sensor_radius)
+        overlap_prob = create_overlap_prob(sigma, sensor_radius, expose_height)
 
     # 6. Bounds check closure
     def bounds_check(positions):
@@ -297,8 +340,9 @@ def create_propagator(
         def compute_for_slot(slot_sensors):
             return compute_sensor_intersections_base(
                 slot_sensors,
-                sensor_positions,
-                sensor_radius,
+                sphere_centres,
+                sensor_axes,
+                sphere_radius,
                 photon_origins,
                 photon_directions,
                 bounds_check,

@@ -4,6 +4,7 @@ loader that builds a :class:`Cylinder` from a PMT-positions ``.npz``
 file. See ``docs/reference/pmt-npz-schema.md`` for the schema.
 """
 
+import json
 import os
 
 import numpy as np
@@ -145,6 +146,7 @@ def test_active_block_reordered_to_barrel_top_bottom(tmp_path):
         det.pmt_directions, [[-1.0, 0, 0], [0, -1.0, 0], [0, 0, -1.0], [0, 0, 1.0]], atol=0
     )
     assert {pid: det.pmt_id_to_idx[pid] for pid in (10, 20, 30, 40)} == {10: 0, 20: 1, 30: 2, 40: 3}
+    npt.assert_array_equal(det.surfaces, ["barrel", "barrel", "top", "bottom"])
 
 
 def test_per_pmt_metadata_reordered(tmp_path):
@@ -314,3 +316,27 @@ def test_generate_detector_loads_via_npz_path(config_name, n_active):
     det = generate_detector(os.path.join(REPO_CONFIG, config_name))
     assert isinstance(det, Cylinder)
     assert len(det.all_points) == n_active
+
+
+def test_generate_detector_forwards_snap_to_wall_option(tmp_path):
+    arrs = _minimal_valid_arrays()
+    arrs["positions_mm"][0] = [800.0, 0.0, 0.0]
+    npz_path = _write_npz(str(tmp_path), **arrs)
+    config_path = tmp_path / "detector.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "material": "water",
+                "detector_type": "cylinder",
+                "geometry_definitions": {
+                    "npz_file_path": os.path.basename(npz_path),
+                    "snap_to_wall": False,
+                },
+            }
+        )
+    )
+
+    det = generate_detector(str(config_path))
+
+    assert det.snap_to_wall is False
+    assert abs(np.linalg.norm(det.barr_points[0, :2]) - 0.8) < 1e-9
