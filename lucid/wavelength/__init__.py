@@ -9,7 +9,15 @@ Submodules:
     scattering    — Rayleigh and Mie/HG phase function samplers
 """
 
-from lucid.wavelength.medium import MediumProperties, load_qe_curve, make_medium
+from lucid.wavelength.medium import (
+    MediumProperties,
+    group_velocity_m_per_ns,
+    load_qe_curve,
+    make_medium,
+    sk4_water_group_refractive_index,
+    sk4_water_refractive_index,
+    sk4_water_refractive_index_derivative,
+)
 from lucid.wavelength.optical_model import OpticalArrays, evaluate_optical_model
 from lucid.wavelength.spectrum import sample_cherenkov_wavelengths
 
@@ -19,6 +27,10 @@ DEFAULT_WAVELENGTH_NM = 400.0
 __all__ = [
     "DEFAULT_WAVELENGTH_NM",
     "MediumProperties",
+    "group_velocity_m_per_ns",
+    "sk4_water_group_refractive_index",
+    "sk4_water_refractive_index",
+    "sk4_water_refractive_index_derivative",
     "load_qe_curve",
     "make_medium",
     "OpticalArrays",

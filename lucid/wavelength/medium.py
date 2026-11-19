@@ -45,6 +45,119 @@ class MediumProperties(NamedTuple):
 
     model: Optional[dict] = None  # the parsed material JSON
 
+    # Dispersion is setup-time/static; the curve is a diagnostic sample of the
+    # analytic model used by ``group_velocity_m_per_ns``.
+    dispersion_model: str = "constant"
+    group_refractive_index_curve: Optional[jnp.ndarray] = None
+
+
+# ---------------------------------------------------------------------------
+# Refractive-index dispersion and group velocity
+# ---------------------------------------------------------------------------
+
+# SK-like water dispersion at 13 C and 1.01325 bar. The phase index n
+# determines the group index n_g = n - lambda * dn/dlambda used for optical
+# time-of-flight updates.
+_SK4_TEMP_C = 13.0
+_SK4_PRESSURE_BAR = 1.01325
+_SK4_TEMP_REF_C = 19.993
+_SK4_PRESSURE_REF_BAR = 1.01325
+_SK4_WLA_UM2 = 0.018085
+_SK4_A = (5.743534e-3, 1.769238, -2.797222e-2, 8.715348e-3, -1.413942e-3)
+_SK4_B = (
+    -8.454823e-5,
+    -2.787742e-5,
+    2.608176e-6,
+    -2.050671e-6,
+    1.019989e-6,
+    -2.611919e-6,
+    8.194989e-9,
+    -8.10707e-9,
+    4.877274e-8,
+)
+_SK4_C = (8.419632e-6, 1.941681e-5, -7.762524e-8, 4.371257e-8, 7.089664e-9, -2.240384e-8)
+
+
+def sk4_water_refractive_index(wavelength_nm):
+    """SK-like phase refractive index for water at 13 C and 1.01325 bar.
+
+    Uses only JAX operations, so wavelength derivatives work in forward
+    and reverse mode.
+    """
+    wl = jnp.asarray(wavelength_nm) / 1000.0  # nm -> micrometres
+    a1, a2, a3, a4, a5 = _SK4_A
+    b1, b2, b3, b4, b5, b6, b7, b8, b9 = _SK4_B
+    c1, c2, c3, c4, c5, c6 = _SK4_C
+    dt = _SK4_TEMP_C - _SK4_TEMP_REF_C
+    dp = _SK4_PRESSURE_BAR - _SK4_PRESSURE_REF_BAR
+    wl2 = wl * wl
+    wl4 = wl2 * wl2
+    wl6 = wl4 * wl2
+    base = jnp.sqrt(a1 / (wl2 - _SK4_WLA_UM2) + a2 + a3 * wl2 + a4 * wl4 + a5 * wl6)
+    return (
+        base
+        + (b1 + b2 * wl2 + b3 * wl4) * dt
+        + (b4 + b5 * wl2 + b6 * wl4) * dt**2
+        + (b7 + b8 * wl2 + b9 * wl4) * dt**3
+        + (c1 + c2 * wl2 + (c3 + c4 * wl2) * _SK4_TEMP_C) * dp
+        + (c5 + c6 * wl2) * dp**2
+    )
+
+
+def sk4_water_refractive_index_derivative(wavelength_nm):
+    """Analytic derivative of the SK-like water phase index, ``dn/dlambda`` per nm."""
+    wl = jnp.asarray(wavelength_nm) / 1000.0
+    a1, _, a3, a4, a5 = _SK4_A
+    _, b2, b3, _, b5, b6, _, b8, b9 = _SK4_B
+    _, c2, _, c4, _, c6 = _SK4_C
+    dt = _SK4_TEMP_C - _SK4_TEMP_REF_C
+    dp = _SK4_PRESSURE_BAR - _SK4_PRESSURE_REF_BAR
+    wl2 = wl * wl
+    wl3 = wl2 * wl
+    wl4 = wl2 * wl2
+    wl5 = wl4 * wl
+    root = jnp.sqrt(
+        _SK4_A[0] / (wl2 - _SK4_WLA_UM2)
+        + _SK4_A[1]
+        + _SK4_A[2] * wl2
+        + _SK4_A[3] * wl4
+        + _SK4_A[4] * wl4 * wl2
+    )
+    derivative_per_um = (
+        (
+            -2.0 * a1 * wl / (wl2 - _SK4_WLA_UM2) ** 2
+            + 2.0 * a3 * wl
+            + 4.0 * a4 * wl3
+            + 6.0 * a5 * wl5
+        )
+        / (2.0 * root)
+        + (2.0 * b2 * wl + 4.0 * b3 * wl3) * dt
+        + (2.0 * b5 * wl + 4.0 * b6 * wl3) * dt**2
+        + (2.0 * b8 * wl + 4.0 * b9 * wl3) * dt**3
+        + (2.0 * c2 * wl + 2.0 * c4 * wl * _SK4_TEMP_C) * dp
+        + 2.0 * c6 * wl * dp**2
+    )
+    return derivative_per_um / 1000.0
+
+
+def sk4_water_group_refractive_index(wavelength_nm):
+    """SK-like water group index: ``n_g = n - lambda * dn/dlambda``."""
+    wavelength_nm = jnp.asarray(wavelength_nm)
+    return sk4_water_refractive_index(
+        wavelength_nm
+    ) - wavelength_nm * sk4_water_refractive_index_derivative(wavelength_nm)
+
+
+def group_velocity_m_per_ns(wavelength_nm, medium):
+    """Return differentiable group velocity for each wavelength."""
+    wavelength_nm = jnp.asarray(wavelength_nm)
+    if medium.dispersion_model == "sk4_water":
+        c_vacuum = medium.speed_of_light * medium.refractive_index
+        return c_vacuum / sk4_water_group_refractive_index(wavelength_nm)
+    if medium.dispersion_model == "constant":
+        return jnp.full_like(wavelength_nm, medium.speed_of_light)
+    raise ValueError(f"Unknown dispersion model {medium.dispersion_model!r}")
+
 
 # ---------------------------------------------------------------------------
 # QE curve loading
@@ -128,12 +241,33 @@ def _scintillation_kwargs_from(data: dict) -> dict:
     }
 
 
+_HC_EV_NM = 1239.84198  # h c in eV nm
+
+
+def _tabulated_coeff(section: dict, wl: jnp.ndarray) -> jnp.ndarray:
+    """1 / length on ``wl`` from a section's ``wavelengths_nm`` / ``length_m`` table.
+
+    The length is interpolated linearly in photon energy and held at the end values outside
+    the table, as Geant4 evaluates a material property, so a table taken from a Geant4 material
+    (WCSim's water) reproduces it.
+    """
+    e_tab = _HC_EV_NM / np.asarray(section["wavelengths_nm"], dtype=np.float64)
+    order = np.argsort(e_tab)
+    length = jnp.interp(
+        _HC_EV_NM / wl,
+        jnp.asarray(e_tab[order], dtype=jnp.float32),
+        jnp.asarray(np.asarray(section["length_m"], dtype=np.float64)[order], dtype=jnp.float32),
+    )
+    return 1.0 / length
+
+
 def load_medium(material: str = "water", medium_model_path: str = None) -> MediumProperties:
     """Read a material JSON once: the scalar :class:`MediumProperties`, carrying the parsed
     file as ``model`` for :func:`medium_on_grid`.
 
     ``medium_model_path`` is the file; without it, ``config/materials/<material>.json``. The
-    record's ``material`` is the file's own ``material`` key.
+    record's ``material`` is the file's own ``material`` key. The file's optional
+    ``dispersion.model`` (``"constant"`` or ``"sk4_water"``) sets the group velocity.
     """
     if medium_model_path is None:
         medium_model_path = os.path.join(_MATERIALS_DIR, f"{material}.json")
@@ -151,6 +285,7 @@ def load_medium(material: str = "water", medium_model_path: str = None) -> Mediu
         refractive_index=n,
         speed_of_light=c_vac / n,
         model=data,
+        dispersion_model=data.get("dispersion", {}).get("model", "constant"),
         **_scintillation_kwargs_from(data),
     )
 
@@ -160,44 +295,65 @@ def medium_on_grid(medium: MediumProperties, wavelength_grid) -> MediumPropertie
     data = medium.model
     n = data["refractive_index"]
     wl = jnp.asarray(wavelength_grid, dtype=jnp.float32)
+    dispersion_model = medium.dispersion_model
+
+    # Each of the three coefficients is either tabulated (``wavelengths_nm`` / ``length_m``,
+    # see `_tabulated_coeff`) or given by the SK calibration paper's parametrisation.
 
     # Symmetric (Rayleigh) scattering coefficient
     sc = data["scattering"]["symmetric"]
-    P4, P5 = sc["P4"], sc["P5"]
-    alpha_sym = P4 / (wl**4) * (1.0 + P5 / (wl**2))
+    if "length_m" in sc:
+        alpha_sym = _tabulated_coeff(sc, wl)
+    else:
+        P4, P5 = sc["P4"], sc["P5"]
+        alpha_sym = P4 / (wl**4) * (1.0 + P5 / (wl**2))
 
     # Asymmetric (Mie) scattering coefficient
     ac = data["scattering"]["asymmetric"]
-    P6, P7, P8 = ac["P6"], ac["P7"], ac["P8"]
-    alpha_asym = P6 * (1.0 + P7 / (wl**4) * (wl - P8) ** 2)
+    if "length_m" in ac:
+        alpha_asym = _tabulated_coeff(ac, wl)
+    else:
+        P6, P7, P8 = ac["P6"], ac["P7"], ac["P8"]
+        alpha_asym = P6 * (1.0 + P7 / (wl**4) * (wl - P8) ** 2)
     g = ac["default_asymmetry_g"]
 
     # Absorption coefficient
     ab = data["absorption"]
-    P0, P1, P2, P3 = ab["P0"], ab["P1"], ab["P2"], ab["P3"]
-    pf_wl = jnp.array(ab["pope_fry_wavelengths_nm"], dtype=jnp.float32)
-    pf_abs = jnp.array(ab["pope_fry_absorption_m_inv"], dtype=jnp.float32)
+    if "length_m" in ab:
+        alpha_abs = _tabulated_coeff(ab, wl)
+    else:
+        P0, P1, P2, P3 = ab["P0"], ab["P1"], ab["P2"], ab["P3"]
+        pf_wl = jnp.array(ab["pope_fry_wavelengths_nm"], dtype=jnp.float32)
+        pf_abs = jnp.array(ab["pope_fry_absorption_m_inv"], dtype=jnp.float32)
 
-    # Eq.(15) power-law fit (blue) spliced onto the Pope&Fry data (red) at 464 nm.
-    # The two pieces differ by ~12% at the seam, so a hard switch leaves a kink; blend
-    # them with a C2 smootherstep over a +-12 nm window. (The blend WEIGHT is C2; the
-    # result inherits the piecewise-linear knot kinks of the interpolated Pope&Fry
-    # table itself — tiny, but not strictly C2.)
-    C_powerlaw = P0 * P2 * (wl / 500.0) ** P3
-    C_popefry = jnp.interp(wl, pf_wl, pf_abs)
-    _bw = 12.0
-    _t = jnp.clip((wl - (464.0 - _bw)) / (2.0 * _bw), 0.0, 1.0)
-    _s = _t * _t * _t * (_t * (_t * 6.0 - 15.0) + 10.0)  # smootherstep (C2)
-    C = (1.0 - _s) * C_powerlaw + _s * C_popefry
-    alpha_abs = P0 * P1 / (wl**4) + C
+        # Eq.(15) power-law fit (blue) spliced onto the Pope&Fry data (red) at 464 nm.
+        # The two pieces differ by ~12% at the seam, so a hard switch leaves a kink; blend
+        # them with a C2 smootherstep over a +-12 nm window.
+        C_powerlaw = P0 * P2 * (wl / 500.0) ** P3
+        C_popefry = jnp.interp(wl, pf_wl, pf_abs)
+        _bw = 12.0
+        _t = jnp.clip((wl - (464.0 - _bw)) / (2.0 * _bw), 0.0, 1.0)
+        _s = _t * _t * _t * (_t * (_t * 6.0 - 15.0) + 10.0)  # smootherstep (C2)
+        C = (1.0 - _s) * C_powerlaw + _s * C_popefry
+        alpha_abs = P0 * P1 / (wl**4) + C
+
+    if dispersion_model == "sk4_water":
+        refractive_index_curve = sk4_water_refractive_index(wl)
+        group_refractive_index_curve = sk4_water_group_refractive_index(wl)
+    elif dispersion_model == "constant":
+        refractive_index_curve = jnp.full_like(wl, n)
+        group_refractive_index_curve = jnp.full_like(wl, n)
+    else:
+        raise ValueError(f"Unknown dispersion model {dispersion_model!r}")
 
     return medium._replace(
         wavelength_grid=wl,
         scatter_coeff=alpha_sym,
         absorption_coeff=alpha_abs,
-        refractive_index_curve=jnp.full_like(wl, n),  # constant n for now
+        refractive_index_curve=refractive_index_curve,
         mie_scatter_coeff=alpha_asym,
         mie_asymmetry=g,
+        group_refractive_index_curve=group_refractive_index_curve,
     )
 
 
