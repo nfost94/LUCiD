@@ -56,10 +56,13 @@ from lucid.fitting.analysis import (
 from lucid.fitting.calib import (
     CalibrationForward,
     CalibrationProblem,
+    DigitResponse,
+    PulseResponse,
+    jackknife_profile,
     neyman_residual,
     profile_gains,
 )
-from lucid.fitting.calibrate import calibrate, closure_data
+from lucid.fitting.calibrate import calibrate, closure_data, pulsed_closure_data
 from lucid.fitting.contracts import CalibForward, PerPhotonPredictor
 from lucid.fitting.fisher import SQRT12, crb, make_constrained_schur
 from lucid.fitting.gn import gauss_newton, gauss_newton_tx
@@ -107,9 +110,13 @@ __all__ = [
     # calibration: entry points, then the pieces
     "calibrate",
     "closure_data",
+    "pulsed_closure_data",
     "CalibrationForward",
     "CalibrationProblem",
+    "PulseResponse",
+    "DigitResponse",
     "profile_gains",
+    "jackknife_profile",
     "neyman_residual",
     # the shared optimiser: the damped Gauss-Newton configuration, its optax pieces, the driver
     "gauss_newton",

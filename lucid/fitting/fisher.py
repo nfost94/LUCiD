@@ -49,7 +49,16 @@ def make_constrained_schur(Hkk):
 
 
 def crb(
-    forward, theta, *, lk_true=None, nphot=None, nb_h=3, honesty=SQRT12, ridge_rel=1e-9, eps=1e-8
+    forward,
+    theta,
+    *,
+    lk_true=None,
+    nphot=None,
+    nb_h=3,
+    honesty=SQRT12,
+    ridge_rel=1e-9,
+    eps=1e-8,
+    marginalize_k=True,
 ):
     """Cramér-Rao bound on the fit parameters at ``theta``.
 
@@ -69,6 +78,10 @@ def crb(
         Jacobian draws averaged per row.
     honesty : float
         σ inflation for the implicit engine's reduced variance (default √12).
+    marginalize_k : bool
+        Marginalise a free per-PMT multiplicative factor when True (the multi-source
+        calibration default). Set False when those factors are fixed, as required for a
+        one-source spatial-pattern calibration.
 
     Returns
     -------
@@ -105,8 +118,12 @@ def crb(
             Htk += (J * w[:, None]).T * Jk[None, :]
             Hkk += w * (Jk * Jk)
 
-    Minv = make_constrained_schur(Hkk)
-    F = 4.0 * (Htt - Htk @ Minv(Htk.T))
+    if marginalize_k:
+        Minv = make_constrained_schur(Hkk)
+        Hglobal = Htt - Htk @ Minv(Htk.T)
+    else:
+        Hglobal = Htt
+    F = 4.0 * Hglobal
     cov_raw = np.linalg.inv(F + ridge_rel * np.median(np.diag(F)) * np.eye(P))
     cov = cov_raw * (honesty**2)
     sigma = np.sqrt(np.clip(np.diag(cov), 0, None))

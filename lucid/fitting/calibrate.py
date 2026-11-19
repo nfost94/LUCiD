@@ -34,7 +34,7 @@ from lucid.fitting.calib import ROLE_TRUTH
 from lucid.fitting.gn import gauss_newton_tx
 from lucid.fitting.minimize import minimize
 
-__all__ = ["calibrate", "closure_data"]
+__all__ = ["calibrate", "closure_data", "pulsed_closure_data"]
 
 
 def calibrate(
@@ -44,6 +44,8 @@ def calibrate(
     tx=None,
     steps=600,
     refresh=20,
+    refresh_final=None,
+    refresh_switch=0.5,
     max_step=0.5,
     polyak=50,
     fix=(),
@@ -70,6 +72,9 @@ def calibrate(
     refresh : int
         Rebuild the Jacobian every ``refresh`` steps. The gradient ``Jᵀr`` uses the cached ``J``
         in between, so a larger value makes the search direction stale, not only the metric.
+    refresh_final, refresh_switch
+        A two-phase schedule: every ``refresh`` steps until ``refresh_switch * steps`` (a refresh
+        forced there), then every ``refresh_final``. None (default): ``refresh`` throughout.
     max_step : float
         Per-component clip on the step; ``0.5`` is +65% in log space.
     polyak : int
@@ -96,6 +101,8 @@ def calibrate(
         max_step=max_step,
         scale=scale,
         refresh=refresh,
+        refresh_final=refresh_final,
+        refresh_switch=refresh_switch,
         readout="polyak" if polyak else "final",
         polyak=polyak,
         fix=fix,
@@ -129,3 +136,30 @@ def closure_data(forward, theta_true, gains=None, *, n_draws=8, seed=0):
     g = jnp.ones(forward.NS) if gains is None else jnp.asarray(gains)
     key = jax.random.fold_in(jax.random.PRNGKey(seed), ROLE_TRUTH)
     return forward.average(jnp.asarray(theta_true, dtype=jnp.float32), key, g, n_draws)
+
+
+def pulsed_closure_data(forward, theta_true, response, gains=None, *, n_draws=8, seed=0):
+    """Pseudo-data from a pulsed source, recorded through the digitizer: ``(data, data_var)``.
+
+    :func:`closure_data` at known parameters and gains sets each sensor's expected photoelectrons
+    per pulse (``response.pulse_scale`` per wavelength); ``response.n_pulses`` pulses are then
+    digitized with dark noise (:func:`lucid.simulation.digitizer.sample_pulse_charge_sums`), on
+    ``numpy.random.default_rng(seed)``. ``data`` is each sensor's summed charge and ``data_var``
+    the variance of that sum from its pulse-to-pulse spread, the Neyman variance
+    :class:`~lucid.fitting.calib.CalibrationProblem` takes.
+    """
+    from lucid.simulation.digitizer import sample_pulse_charge_sums
+
+    mu = np.asarray(
+        closure_data(forward, theta_true, gains, n_draws=n_draws, seed=seed), dtype=np.float64
+    )
+    scale = np.asarray(response.pulse_scale, dtype=np.float64)
+    n = response.n_pulses
+    rng = np.random.default_rng(seed)
+    data, var = np.empty_like(mu), np.empty_like(mu)
+    for g in range(mu.shape[0]):  # rows g = wl * n_sources + s
+        s, s2 = sample_pulse_charge_sums(
+            scale[g // forward.n_sources] * mu[g], n, response.model, rng, dark_mu=response.dark_mu
+        )
+        data[g], var[g] = s, s2 - s * s / n
+    return jnp.asarray(data, dtype=jnp.float32), jnp.asarray(var, dtype=jnp.float32)
