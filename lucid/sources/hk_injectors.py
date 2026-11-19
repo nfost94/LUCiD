@@ -37,13 +37,14 @@ def injector_position_direction(injector_type, idx, detector='ID', *, injectors_
 
 
 def injector_sources(injector_type, sample_id, idx=None, *, injectors_path, common_profiles_dir,
-                     detector='ID', intensity=1e6):
+                     detector='ID', intensity=1e6, roll_symmetric=False):
     """measured_profile_source(...) instances at real injector positions, all built from
     the one loaded `sample_id` profile (e.g. 'WarwickDA02' for diffuser,
     'WarwickCol_C01_repeat' for collimator).
 
     idx : injector 'idx' values (from the JSON) to select, e.g. ['0', '28', '32'] --
         None selects every entry of this type/detector.
+    roll_symmetric : diffusers only; draw the azimuth uniformly (see measured_profile_source).
     """
     entries = load_injectors(injector_type, detector=detector, injectors_path=injectors_path)
     if idx is not None:
@@ -57,6 +58,7 @@ def injector_sources(injector_type, sample_id, idx=None, *, injectors_path, comm
             sample_id=sample_id,
             common_profiles_dir=common_profiles_dir,
             intensity=intensity,
+            roll_symmetric=roll_symmetric,
         )
         for e in entries
     ]

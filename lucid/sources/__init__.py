@@ -28,6 +28,9 @@ __all__ = [
     "profile_intensity",
     "PROFILE_FORMS",
     "N_PROFILE_PARAMS",
+    "TABLE_ANGLES_DEG",
+    "set_table_nodes",
+    "get_table_nodes",
     "load_injectors",
     "injector_position_direction",
     "injector_sources",
@@ -61,6 +64,9 @@ from lucid.sources.calibration_sources import (
     profile_intensity,
     PROFILE_FORMS,
     N_PROFILE_PARAMS,
+    TABLE_ANGLES_DEG,
+    set_table_nodes,
+    get_table_nodes,
 )
 from lucid.sources.hk_injectors import (
     load_injectors, injector_position_direction, injector_sources,

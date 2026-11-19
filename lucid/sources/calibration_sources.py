@@ -508,9 +508,18 @@ class MeasuredProfileSource(NamedTuple):
 
 
 def measured_profile_source(position, direction, sample_id, common_profiles_dir,
-                             intensity=1_000_000, wavelength=None):
-    """Build a MeasuredProfileSource from a common_profiles/<sample_id>.npz scan."""
+                             intensity=1_000_000, wavelength=None, roll_symmetric=False):
+    """Build a MeasuredProfileSource from a common_profiles/<sample_id>.npz scan.
+
+    roll_symmetric : diffusers only. Draw the azimuth uniformly instead of from the scan's roll sweeps. The polar angle is still drawn from
+        the scan's marginal CDF, the mean over the sweeps, so the diffuser is one axisymmetric profile. Use it when the roll structure of
+        a scan is taken to belong to the scan (a tilt of the axis, noise) and not to the device.
+    """
     fine_u, marginal_cdf, fine_phi, cond, device_type = build_profile_cdf(common_profiles_dir, sample_id)
+    if roll_symmetric:
+        if device_type != 'diffuser':
+            raise ValueError(f"roll_symmetric is for diffusers; {sample_id} is a {device_type} (its scan is a map in azimuth)")
+        cond = np.tile(np.linspace(0.0, 1.0, np.shape(cond)[1]), (np.shape(cond)[0], 1))     # one flat conditional CDF in phi: uniform azimuth
 
     rotation_axis, rotation_angle = _axis_angle_from_x_axis(jnp.asarray(direction, dtype=jnp.float32))
     wl = jnp.asarray(float(wavelength), dtype=jnp.float32) if wavelength is not None else None
@@ -563,8 +572,17 @@ def fitted_profile_source(position, direction, params, alpha_max,
 # the proposal every ray counts about equally, and fitting the parameters never moves a ray. The cap must
 # contain all the emitted light: anything beyond alpha_cut is dropped.
 
-PROFILE_FORMS = ('composite', 'super_gaussian', 'sk_beam', 'physical')   # index = DifferentiableProfileSource.profile_id
-N_PROFILE_PARAMS = 9                     # params is padded to this length for the shorter forms
+PROFILE_FORMS = ('composite', 'super_gaussian', 'sk_beam', 'table', 'table_cubic')   # index = DifferentiableProfileSource.profile_id
+
+# The default nodes (deg) of the profile table: the best 36 of the scans' whole degrees, found by dynamic programming with
+# every slice of cos(alpha) between neighbouring nodes at least 0.006, so that every node has PMTs under it. Sparse in the core, every degree across the edge
+# (44-52) and the cutoff (80-85), where the profile changes fastest. Nodes on the scans' own degrees reproduce the measured source's interpolation exactly.
+# Other node sets are registered with set_table_nodes (the tables carry their nodes).
+_TABLE_NODES_DEG = [0.0, 7.0, 13.0, 20.0, 24.0, 27.0, 29.0, 32.0, 35.0, 37.0, 39.0, 42.0, 44.0, 45.0, 46.0, 47.0, 48.0, 49.0, 50.0, 51.0, 52.0,
+                    55.0, 59.0, 63.0, 69.0, 71.0, 75.0, 78.0, 80.0, 81.0, 82.0, 83.0, 84.0, 85.0, 88.0, 90.0]
+TABLE_ANGLES_DEG = np.array(_TABLE_NODES_DEG, dtype=np.float32)
+N_PROFILE_PARAMS = 90        # params is padded to this length for the shorter forms; the table forms take one log-drop per gap, so at most 91 nodes
+_HALO_REF = 4.0              # deg: where the composite's halo level hp is quoted
 
 
 def _power(x, k):
@@ -573,9 +591,13 @@ def _power(x, k):
 
 
 def _profile_composite(alpha_deg, params):
-    # Super-Gaussian core x Fermi edge: exp(-(a/w)^(2p)) / (1 + exp((a - a0)/s)); params (w, p, a0, s).
-    w, p, a0, s = params[0], params[1], params[2], params[3]
-    return jnp.exp(-_power(alpha_deg / w, 2 * p)) * jax.nn.sigmoid((a0 - alpha_deg) / s)
+    # Super-Gaussian core x Fermi edge, exp(-(a/w)^(2p)) / (1 + exp((a - a0)/s)), plus a halo: params (w, p, a0, s, hp, n, h1, lam), the last four optional (the
+    # zero padding gives none). The halo is hp (max(a, a0) / 4 deg)^-n, a power-law tail from the edge outwards (n = 0 a constant floor), plus h1 exp(-max(a - a0, 0) / lam),
+    # a skirt of amplitude h1 at the edge. Under the disc it is constant, where it can't be seen. This is the collimators' profile (their scans in water end at 4.25 deg).
+    w, p, a0, s, hp, n, h1, lam = (params[i] for i in range(8))
+    core = jnp.exp(-_power(alpha_deg / w, 2 * p)) * jax.nn.sigmoid((a0 - alpha_deg) / s)
+    halo = hp * _power(jnp.maximum(alpha_deg, a0) / _HALO_REF, -n) + h1 * jnp.exp(-jnp.maximum(alpha_deg - a0, 0.0) / jnp.maximum(lam, 1e-6))
+    return core + halo
 
 
 def _profile_super_gaussian(alpha_deg, params):
@@ -593,64 +615,78 @@ def _profile_sk_beam(alpha_deg, params):
     return jnp.exp(-jnp.tan(t) ** 4 / (2 * s * s)) / jnp.cos(t) ** 3
 
 
-# The physical diffuser model (profile_table_map.ipynb in the HKUKLI project, its baseline): a PTFE dome in a dry
-# torch behind a flat window, in water. Direct light: the dome's projected area (1 + cos t)/2 x cos^m t x a
-# logistic torch eclipse (theta_t, w_t) at internal angle t = asin(n_w sin a), times the Fresnel transmission
-# of the window's two faces and the solid-angle factor n_w^2 cos a / cos t; it all exits within asin(1/n_w).
-# Beyond that, a tail (B, lam_t, a_c, s_c). Then the scan's bench blur: a semicircle of half-width d_par
-# convolved with a Gaussian sig_g, on a fixed grid with the profile mirrored at a = 0 (the kernel's support
-# is fixed at +-_PHYS_KERNEL deg so shapes stay static; it truncates only if d_par + 4 sig_g exceeds it).
-_PHYS_N_WATER, _PHYS_N_GLASS = 1.34, 1.50
-_PHYS_DA = 0.05
-_PHYS_GRID = np.arange(0.0, 90.0 + _PHYS_DA / 2, _PHYS_DA)
-_PHYS_KERNEL = 15.0
-_PHYS_KX = np.arange(-int(round(_PHYS_KERNEL / _PHYS_DA)), int(round(_PHYS_KERNEL / _PHYS_DA)) + 1) * _PHYS_DA
+# The 'table' profile: the intensity per solid angle at the registered nodes (TABLE_ANGLES_DEG by default), as a cumulative sum of log-drops: ln v_0 = 0 (1 on axis, which
+# also fixes the overall scale the sources cannot see) and ln v_{i+1} = ln v_i - exp(l_i), the l_i (one per gap) being the source's parameters. So any
+# parameters give a strictly decreasing, positive profile, and a parameter is a relative drop, comparable from the core to the tail. Linear in cos(alpha)
+# between the nodes, which is how the measured source interpolates a scan. Build a source at the starting table (a measured mean profile, say): its
+# directions are drawn from it, and fitting the l_i then moves only the ray weights.
+_TABLE_STATE = {}                                                   # the registered nodes: set_table_nodes fills it (at import, with the defaults)
+_TABLE_MAX_LOGDROP = 10.0                                           # exp(l) is capped here, far beyond any drop the data can see
+_TABLE_FLAT_SLOPE = 1e-12                                           # d ln v / d cos(alpha) below this is flat for the cubic form (and 1/slope^2 stays finite in float32)
 
 
-def _fresnel_T(ci, n1, n2):
-    """Unpolarised Fresnel transmittance n1 -> n2 at incidence cosine ci (0 beyond TIR)."""
-    s2t = (n1 / n2) ** 2 * (1 - ci ** 2)
-    ct = jnp.sqrt(jnp.clip(1 - s2t, 0, 1))
-    rs = ((n1 * ci - n2 * ct) / (n1 * ci + n2 * ct + 1e-12)) ** 2
-    rp = ((n2 * ci - n1 * ct) / (n2 * ci + n1 * ct + 1e-12)) ** 2
-    return jnp.where(s2t < 1, 1 - 0.5 * (rs + rp), 0.0)
+def set_table_nodes(nodes_deg):
+    """Register the nodes (deg) of the profile table: strictly increasing from 0 to 90, at most N_PROFILE_PARAMS + 1 of them (a log-drop per gap).
+
+    The nodes are constants of the traced profile functions, so register them before a source is built or anything is traced; registering
+    different nodes later clears JAX's compilation caches. A source's parameters are the log-drops between the nodes registered when it is used."""
+    nodes = np.asarray(nodes_deg, dtype=np.float64)
+    if nodes.ndim != 1 or len(nodes) < 3 or len(nodes) - 1 > N_PROFILE_PARAMS:
+        raise ValueError(f'the table needs 3 to {N_PROFILE_PARAMS + 1} nodes, got {nodes.shape}')
+    if nodes[0] != 0.0 or nodes[-1] != 90.0 or np.any(np.diff(nodes) <= 0):
+        raise ValueError('the table nodes must increase strictly from 0 to 90 deg')
+    new = dict(nodes=nodes.astype(np.float32), u=np.cos(np.radians(nodes))[::-1].astype(np.float32), n_gaps=len(nodes) - 1)
+    changed = bool(_TABLE_STATE) and not np.array_equal(_TABLE_STATE['nodes'], new['nodes'])
+    _TABLE_STATE.clear()
+    _TABLE_STATE.update(new)
+    if changed and hasattr(jax, 'clear_caches'):
+        jax.clear_caches()
 
 
-def _profile_physical(alpha_deg, params):
-    # params (m, theta_t, w_t, log B, lam_t, a_c, s_c, d_par, sig_g), angles in deg.
-    m, th_t, w_t, logB, lam_t, a_c, s_c, d_par, sig_g = (params[i] for i in range(9))
-    n_w, n_g = _PHYS_N_WATER, _PHYS_N_GLASS
-    a = jnp.asarray(_PHYS_GRID)
-    sa = n_w * jnp.sin(jnp.radians(a))
-    inside = sa < 1
-    ct = jnp.sqrt(jnp.clip(1 - sa ** 2, 1e-9, 1))
-    c_glass = jnp.sqrt(jnp.clip(1 - (sa / n_g) ** 2, 0, 1))
-    T = jnp.where(inside, _fresnel_T(ct, 1.0, n_g) * _fresnel_T(c_glass, n_g, n_w), 0.0)
-    jac = jnp.where(inside, n_w ** 2 * jnp.cos(jnp.radians(a)) / ct, 0.0)
-    theta = jnp.degrees(jnp.arcsin(jnp.clip(sa, 0, 1)))
-    cth = jnp.cos(jnp.radians(theta))
-    direct = (1 + cth) / 2 * _power(cth, m) * jax.nn.sigmoid((th_t - theta) / w_t) * T * jac
-    a_max = np.degrees(np.arcsin(1 / n_w))
-    tail = (jnp.exp(logB) * jax.nn.sigmoid((a - a_max) / 0.3) * jnp.exp(-jnp.clip(a - a_max, 0) / lam_t)
-            * jax.nn.sigmoid((a_c - a) / s_c))
-    y = direct + tail
-    x = jnp.asarray(_PHYS_KX)
-    semi = jnp.where(d_par > _PHYS_DA, jnp.sqrt(jnp.clip(1 - (x / jnp.maximum(d_par, 1e-6)) ** 2, 0, None)),
-                     (x == 0).astype(y.dtype))
-    gauss = jnp.exp(-0.5 * (x / jnp.maximum(sig_g, 1e-6)) ** 2)
-    k = jnp.where(sig_g > _PHYS_DA, jnp.convolve(semi, gauss, mode='same'), semi)
-    k = k / jnp.sum(k)
-    h = len(_PHYS_KX) // 2
-    yy = jnp.concatenate([y[h:0:-1], y, jnp.full(h, y[-1])])
-    return jnp.interp(alpha_deg, a, jnp.convolve(yy, k, mode='valid'))
+def get_table_nodes():
+    """The nodes (deg) of the profile table that are registered now."""
+    return _TABLE_STATE['nodes'].copy()
+
+
+set_table_nodes(TABLE_ANGLES_DEG)
+
+
+def _profile_table(alpha_deg, params):
+    # params (l_0, ..., l_{n_gaps-1}): the log-drops between the registered nodes; the rest is padding. 1 on axis.
+    drops = jnp.exp(jnp.minimum(params[:_TABLE_STATE['n_gaps']], _TABLE_MAX_LOGDROP))
+    v = jnp.exp(-jnp.concatenate([jnp.zeros(1), jnp.cumsum(drops)]))
+    return jnp.interp(jnp.cos(jnp.radians(alpha_deg)), jnp.asarray(_TABLE_STATE['u']), v[::-1])
+
+
+# The 'table_cubic' profile: the parameters and nodes of 'table', but ln v is carried between the nodes by a monotone cubic in cos(alpha) (Fritsch-Carlson, the slopes of
+# scipy's PchipInterpolator, the end slopes the adjacent secants) instead of v by a straight line, so the curvature between nodes is followed. ln v rises strictly with
+# cos(alpha) at the nodes for any parameters and this cubic never overshoots them, so the profile stays positive, 1 on axis and non-increasing. Where a neighbouring secant is
+# flat (below _TABLE_FLAT_SLOPE, which takes in drops that underflow) the slope at the node is 0: the divisions are guarded by a where whose unused branch is kept finite, and
+# no secant that is divided by is smaller than the threshold, so the gradient has no NaN there either. 'table' (the straight lines) is unchanged and stays as the backup form.
+def _profile_table_cubic(alpha_deg, params):
+    drops = jnp.exp(jnp.minimum(params[:_TABLE_STATE['n_gaps']], _TABLE_MAX_LOGDROP))
+    y = (-jnp.concatenate([jnp.zeros(1), jnp.cumsum(drops)]))[::-1]          # ln v at the nodes, by increasing cos(alpha): non-decreasing
+    u = jnp.asarray(_TABLE_STATE['u'])
+    h = jnp.diff(u)
+    s = jnp.diff(y) / h                                                         # the secant slopes (>= 0)
+    sa, sb, ha, hb = s[:-1], s[1:], h[:-1], h[1:]
+    w1, w2 = 2 * hb + ha, hb + 2 * ha
+    both = (sa > _TABLE_FLAT_SLOPE) & (sb > _TABLE_FLAT_SLOPE)                  # a node next to a flat secant is flat
+    sa_safe, sb_safe = jnp.where(both, sa, 1.0), jnp.where(both, sb, 1.0)
+    d = jnp.concatenate([s[:1], jnp.where(both, (w1 + w2) / (w1 / sa_safe + w2 / sb_safe), 0.0), s[-1:]])
+    x = jnp.clip(jnp.cos(jnp.radians(alpha_deg)), u[0], u[-1])
+    k = jnp.clip(jnp.searchsorted(u, x, side='right') - 1, 0, u.shape[0] - 2)
+    t = (x - u[k]) / h[k]
+    t2, t3 = t * t, t * t * t
+    ln_v = (2 * t3 - 3 * t2 + 1) * y[k] + (t3 - 2 * t2 + t) * h[k] * d[k] + (3 * t2 - 2 * t3) * y[k + 1] + (t3 - t2) * h[k] * d[k + 1]
+    return jnp.exp(ln_v)
 
 
 def profile_intensity(alpha_deg, params, profile_id):
     """Relative intensity per solid angle at off-axis angle ``alpha_deg`` for profile ``profile_id``
     (an index into PROFILE_FORMS). ``params`` is a length-N_PROFILE_PARAMS array, padded for the
     shorter forms."""
-    return jax.lax.switch(profile_id, (_profile_composite, _profile_super_gaussian,
-                                       _profile_sk_beam, _profile_physical), alpha_deg, params)
+    return jax.lax.switch(profile_id, (_profile_composite, _profile_super_gaussian, _profile_sk_beam, _profile_table, _profile_table_cubic), alpha_deg, params)
 
 
 _PROPOSAL_BINS = 2048     # equal-angle bins over the cap for the proposal's CDF
@@ -717,17 +753,17 @@ class DifferentiableProfileSource(NamedTuple):
         )
 
 
-def differentiable_profile_source(position, direction, params, alpha_cut, profile='composite',
+def differentiable_profile_source(position, direction, params, alpha_cut, profile='table',
                                   intensity=1_000_000, wavelength=None):
     """Build a :class:`DifferentiableProfileSource`.
 
     Parameters
     ----------
     params : sequence
-        Profile parameters, angles in degrees: ``composite`` (w, p, a0, s);
-        ``super_gaussian`` (w, p); ``sk_beam`` (sigbm,); ``physical`` (m, theta_t, w_t, log B, lam_t,
-        a_c, s_c, d_par, sig_g). Also the proposal the directions are drawn from: build the source at
-        the profile a fit will stay near.
+        Profile parameters, angles in degrees: ``table`` (l_0, ..., l_{n-1}), the log-drops between the nodes registered with :func:`set_table_nodes`, the
+        form a fit takes; ``table_cubic``, the same parameters with a monotone cubic through the nodes in place of straight lines; ``composite`` (w, p, a0, s[, hp, n, h1, lam]), a super-Gaussian core with a Fermi edge and an optional halo, the form of a truth
+        source (a collimator's profile, where the water scans end at 4.25 deg); ``super_gaussian`` (w, p); ``sk_beam`` (sigbm,). Also the
+        proposal the directions are drawn from: build the source at the profile a fit will stay near.
     alpha_cut : float
         Half-angle (deg) of the sampled cap; must contain all the emitted light.
     profile : str
